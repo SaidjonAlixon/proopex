@@ -349,12 +349,8 @@ export default function TgEntryPage() {
   };
 
   const openBotForNewToken = () => {
-    const wa = window.Telegram?.WebApp;
-    try {
-      wa?.openTelegramLink?.("https://t.me/vaksinahrbot?start=kirish");
-    } catch {
-      window.open("https://t.me/vaksinahrbot", "_blank");
-    }
+    // @vaksinahrbot PROOPEX da ishlatilmaydi — saytga yo‘naltiramiz
+    window.open("https://proopex.uz/login", "_blank");
   };
 
   if (phase === "gate" && gate) {

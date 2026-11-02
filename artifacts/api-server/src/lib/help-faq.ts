@@ -137,21 +137,15 @@ export const HELP_FAQS: HelpFaq[] = [
     id: "telegram",
     titleUz: "Telegram",
     titleRu: "Telegram",
-    keywords: ["telegram", "bot", "mini app", "tg", "vaksinahr", "kirish", "вход"],
+    keywords: ["telegram", "bot", "mini app", "tg", "kirish", "вход"],
     answerUz:
-      "Tizimga ikki xil usulda kirish mumkin:\n• Telegram boti orqali — login/parol yuborganingizdan so‘ng kirish havolasini beradi.\n• Rasmiy sayt orqali.",
+      "Tizimga rasmiy sayt orqali kiring: proopex.uz — login va parol bilan.\n@vaksinahrbot bu platformada ishlatilmaydi.",
     answerRu:
-      "Войти в систему можно двумя способами:\n• Через Telegram-бота — после логина/пароля выдаёт ссылку входа.\n• Через официальный сайт.",
+      "Входите через официальный сайт: proopex.uz — логин и пароль.\n@vaksinahrbot на этой платформе не используется.",
     links: [
       {
-        label: "@vaksinahrbot",
-        url: "https://t.me/vaksinahrbot",
-        hintUz: "Telegram bot",
-        hintRu: "Telegram-бот",
-      },
-      {
-        label: "vaksinahr.uz",
-        url: "https://www.vaksinahr.uz/",
+        label: "proopex.uz",
+        url: "https://proopex.uz/",
         hintUz: "Veb sayt",
         hintRu: "Веб-сайт",
       },

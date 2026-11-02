@@ -80,8 +80,8 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
   const [verifyLink, setVerifyLink] = useState<string | null>(null);
   const [emailSent, setEmailSent] = useState(false);
   const [targetMasked, setTargetMasked] = useState('');
-  const [botUsername, setBotUsername] = useState('vaksinahrbot');
-  const [telegramReady, setTelegramReady] = useState(true);
+  const [botUsername, setBotUsername] = useState<string | null>(null);
+  const [telegramReady, setTelegramReady] = useState(false);
   const [fullName, setFullName] = useState('');
   const [password, setPassword] = useState('');
   const [password2, setPassword2] = useState('');
@@ -96,8 +96,14 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
     const fromVite = String(import.meta.env.VITE_GOOGLE_CLIENT_ID || '').trim();
     void fetchTrialConfig().then((c) => {
       setGoogleClientId(c.googleClientId || fromVite || null);
-      if (c.botUsername) setBotUsername(c.botUsername.replace(/^@/, ''));
-      setTelegramReady(c.telegramConfigured !== false);
+      const raw = String(c.botUsername || '')
+        .trim()
+        .replace(/^@/, '')
+        .toLowerCase();
+      // @vaksinahrbot PROOPEX da umuman ishlatilmaydi
+      const okBot = Boolean(c.telegramConfigured && raw && raw !== 'vaksinahrbot');
+      setBotUsername(okBot ? raw : null);
+      setTelegramReady(okBot);
     });
   }, []);
 
@@ -121,9 +127,9 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
     [toast],
   );
 
-  /** Rasmiy Telegram Login Widget — akkauntni ulash oynasi */
+  /** Rasmiy Telegram Login Widget — faqat PROOPEX boti (vaksinahrbot emas) */
   useEffect(() => {
-    if (step !== 'method') return;
+    if (step !== 'method' || !telegramReady || !botUsername) return;
     const host = tgWidgetRef.current;
     if (!host) return;
 
@@ -135,7 +141,7 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
     const script = document.createElement('script');
     script.async = true;
     script.src = 'https://telegram.org/js/telegram-widget.js?22';
-    script.setAttribute('data-telegram-login', botUsername.replace(/^@/, ''));
+    script.setAttribute('data-telegram-login', botUsername);
     script.setAttribute('data-size', 'large');
     script.setAttribute('data-radius', '12');
     script.setAttribute('data-request-access', 'write');
@@ -148,7 +154,7 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
       if (window.onTelegramAuth) delete window.onTelegramAuth;
       host.innerHTML = '';
     };
-  }, [step, botUsername, finishTelegramLink]);
+  }, [step, botUsername, telegramReady, finishTelegramLink]);
 
   /** Gmail havolasi: ?verify=token yoki server redirect ?verified=challengeId */
   useEffect(() => {
@@ -373,37 +379,36 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
             </span>
           </button>
 
-          <div className="trial-or" role="separator">
-            <span>yoki</span>
-          </div>
-
-          <div className="trial-tg-card">
-            <div className="trial-tg-card-head">
-              <TelegramGlyph className="trial-tg-ico trial-tg-ico--lg" />
-              <div>
-                <div className="trial-tg-card-title">Telegram akkauntini ulash</div>
-                <div className="trial-tg-card-hint">Botga o‘tmasdan — Telegram orqali tasdiqlang</div>
+          {telegramReady && botUsername ? (
+            <>
+              <div className="trial-or" role="separator">
+                <span>yoki</span>
               </div>
-            </div>
-            <p className="trial-tg-help">
-              «Log in with Telegram» tugmasini bosing, akkauntingizni tanlang, keyin saytda parol o‘rnating.
-            </p>
-            {!telegramReady ? (
-              <p className="text-xs font-semibold text-amber-700 dark:text-amber-300">
-                Telegram serverda sozlanmagan (TELEGRAM_BOT_TOKEN).
-              </p>
-            ) : null}
-            <div className="trial-tg-widget-wrap" aria-busy={pending}>
-              {pending ? (
-                <div className="flex items-center justify-center gap-2 py-3 text-sm text-sky-800 dark:text-sky-100">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Telegram ulanmoqda…
+
+              <div className="trial-tg-card">
+                <div className="trial-tg-card-head">
+                  <TelegramGlyph className="trial-tg-ico trial-tg-ico--lg" />
+                  <div>
+                    <div className="trial-tg-card-title">Telegram akkauntini ulash</div>
+                    <div className="trial-tg-card-hint">Telegram orqali tasdiqlang</div>
+                  </div>
                 </div>
-              ) : (
-                <div ref={tgWidgetRef} className="trial-tg-widget" />
-              )}
-            </div>
-          </div>
+                <p className="trial-tg-help">
+                  «Log in with Telegram» tugmasini bosing, akkauntingizni tanlang, keyin saytda parol o‘rnating.
+                </p>
+                <div className="trial-tg-widget-wrap" aria-busy={pending}>
+                  {pending ? (
+                    <div className="flex items-center justify-center gap-2 py-3 text-sm text-sky-800 dark:text-sky-100">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Telegram ulanmoqda…
+                    </div>
+                  ) : (
+                    <div ref={tgWidgetRef} className="trial-tg-widget" />
+                  )}
+                </div>
+              </div>
+            </>
+          ) : null}
         </div>
       ) : null}
 

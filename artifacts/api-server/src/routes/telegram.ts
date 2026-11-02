@@ -642,8 +642,21 @@ async function handleUpdate(update: TelegramUpdate) {
     });
     if (gated) return;
     const gText = (msg.text ?? msg.caption ?? "").toLowerCase();
+    // @vaksinahrbot — PROOPEX da javob berilmaydi / ishlatilmaydi
+    if (gText.includes("@vaksinahrbot") || msg.reply_to_message?.from?.username === "vaksinahrbot") {
+      return;
+    }
+    let botUsername = "";
+    try {
+      const me = await getMe();
+      botUsername = String(me.username || "").toLowerCase();
+    } catch {
+      botUsername = "";
+    }
     const directToBot =
-      gText.includes("@vaksinahrbot") || msg.reply_to_message?.from?.username === "vaksinahrbot";
+      Boolean(botUsername) &&
+      (gText.includes(`@${botUsername}`) ||
+        msg.reply_to_message?.from?.username?.toLowerCase() === botUsername);
     if (directToBot) {
       await runSupportTask(() => handleAiAssistantMessage(msg, { businessConnectionId }));
       return;

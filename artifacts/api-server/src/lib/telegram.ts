@@ -90,6 +90,15 @@ function botToken(): string | null {
   return t || null;
 }
 
+/** PROOPEX da ishlatilmaydigan (boshqa loyiha) botlar */
+export function isForbiddenTelegramBot(username?: string | null): boolean {
+  const u = String(username || "")
+    .trim()
+    .replace(/^@/, "")
+    .toLowerCase();
+  return u === "vaksinahrbot";
+}
+
 export function isTelegramConfigured(): boolean {
   return !!botToken();
 }
@@ -295,6 +304,25 @@ export async function answerCallbackQuery(id: string, text?: string) {
 
 export async function getMe() {
   return tgCall<{ id: number; username?: string; first_name?: string }>("getMe", {});
+}
+
+/** PROOPEX uchun bot username — @vaksinahrbot hech qachon qaytmaydi */
+export async function resolveProopexBotUsername(): Promise<string | null> {
+  const fromEnv = String(process.env.TELEGRAM_BOT_USERNAME || "")
+    .trim()
+    .replace(/^@/, "");
+  if (fromEnv) {
+    return isForbiddenTelegramBot(fromEnv) ? null : fromEnv;
+  }
+  if (!botToken()) return null;
+  try {
+    const me = await getMe();
+    const u = String(me.username || "").trim();
+    if (!u || isForbiddenTelegramBot(u)) return null;
+    return u;
+  } catch {
+    return null;
+  }
 }
 
 export async function setWebhook(url: string, secret?: string) {

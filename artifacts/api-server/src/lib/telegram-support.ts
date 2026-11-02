@@ -1,6 +1,6 @@
 /**
- * @vaksinahrbot — guruh va shaxsiy chatdagi yordam javoblari.
- * AI ishlatilmaydi: xabar kalit so‘zlar (lotin + kirill) bo‘yicha mavzuga ajratiladi va tayyor javob reply qilinadi.
+ * Telegram guruh/shaxsiy chat yordam javoblari.
+ * @vaksinahrbot PROOPEX da ishlatilmaydi.
  */
 import { faqAnswer, matchHelpFaq } from "./help-faq";
 import { logger } from "./logger";
@@ -8,13 +8,14 @@ import {
   deleteMessage,
   escapeHtml,
   getMe,
+  isForbiddenTelegramBot,
   sendMessage,
   type InlineKeyboardButton,
   type TelegramMessage,
 } from "./telegram";
 
-const SITE_URL = "https://vaksinahr.uz";
-const SITE_LABEL = "vaksinahr.uz";
+const SITE_URL = "https://proopex.uz";
+const SITE_LABEL = "proopex.uz";
 
 const USER_COOLDOWN_MS = 20_000;
 const DUPLICATE_WINDOW_MS = 15 * 60 * 1000;
@@ -33,9 +34,13 @@ async function getBotInfo(): Promise<{ id: number; username: string }> {
   if (botInfo) return botInfo;
   try {
     const me = await getMe();
-    botInfo = { id: me.id, username: me.username || "vaksinahrbot" };
+    const username = String(me.username || "").trim();
+    if (!username || isForbiddenTelegramBot(username)) {
+      return { id: 0, username: "" };
+    }
+    botInfo = { id: me.id, username };
   } catch {
-    return { id: 0, username: "vaksinahrbot" };
+    return { id: 0, username: "" };
   }
   return botInfo;
 }
@@ -161,9 +166,9 @@ const CREDENTIAL_LEAK_RE =
 /* ------------------------------------------------------ tayyor javoblar ---- */
 
 const TWO_WAYS = [
-  `🌐 Platformaga faqat 2 usulda kiriladi:`,
-  `1) <b>${SITE_LABEL}</b> — telefon brauzerida (iPhone: Safari, Android: Chrome) oching, login va parolingizni kiriting.`,
-  `2) <b>@vaksinahrbot</b> — botni oching, «Start» bosing va login hamda parolingizni bitta xabarda yuboring: <code>login parol</code>`,
+  `🌐 Platformaga <b>${SITE_LABEL}</b> orqali kiring:`,
+  `Telefon brauzerida (iPhone: Safari, Android: Chrome) oching, login va parolingizni kiriting.`,
+  `@vaksinahrbot bu platformada ishlatilmaydi.`,
 ].join("\n");
 
 const COORDINATOR_NOTE =
@@ -222,7 +227,7 @@ const ANSWERS = {
     compose(
       [
         "🔐 <b>Kirish yoki ishlashda muammo bo‘lsa, tekshiring:</b>",
-        `1) Faqat <b>${SITE_LABEL}</b> yoki <b>@vaksinahrbot</b> orqali kiryapsizmi (boshqa ilova/havola yo‘q).`,
+        `1) Faqat <b>${SITE_LABEL}</b> orqali kiryapsizmi (boshqa bot/ilova yo‘q; @vaksinahrbot ishlatilmaydi).`,
         "2) Login va parol lotin harflarida, bo‘sh joysiz, katta-kichik harflari to‘g‘ri yozilganmi.",
         "3) Internet ishlayaptimi — sahifani yangilang yoki brauzerni yopib qayta oching (iPhone: Safari, Android: Chrome).",
         "4) Botdagi havola eskirgan bo‘lsa — /kirish yoki «🔄 Yangi kirish havolasi».",

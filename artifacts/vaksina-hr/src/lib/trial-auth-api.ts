@@ -23,8 +23,8 @@ export async function fetchTrialConfig() {
       googleClientId: null as string | null,
       phonePrefix: '+998',
       trialDays: 7,
-      telegramConfigured: true,
-      botUsername: '@vaksinahrbot',
+      telegramConfigured: false,
+      botUsername: null as string | null,
     };
   }
   return (await res.json()) as {
@@ -32,7 +32,7 @@ export async function fetchTrialConfig() {
     phonePrefix: string;
     trialDays: number;
     telegramConfigured?: boolean;
-    botUsername?: string;
+    botUsername?: string | null;
   };
 }
 

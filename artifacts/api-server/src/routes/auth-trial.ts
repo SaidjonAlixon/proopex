@@ -32,7 +32,12 @@ import {
   sendEskizSms,
 } from "../lib/eskiz-sms";
 import { sendTrialVerifyEmail } from "../lib/trial-email";
-import { getMe, isTelegramConfigured, verifyTelegramLoginWidget } from "../lib/telegram";
+import {
+  isForbiddenTelegramBot,
+  isTelegramConfigured,
+  resolveProopexBotUsername,
+  verifyTelegramLoginWidget,
+} from "../lib/telegram";
 
 const router: IRouter = Router();
 
@@ -57,11 +62,14 @@ async function getUserWithDept(userId: number) {
   return user ?? null;
 }
 
-/** Telegram Login Widget — akkauntni ulash */
+/** Telegram Login Widget — akkauntni ulash (@vaksinahrbot ishlatilmaydi) */
 router.post("/auth/trial/telegram/link", async (req, res): Promise<void> => {
   try {
-    if (!isTelegramConfigured()) {
-      res.status(503).json({ error: "Telegram sozlanmagan — admin TELEGRAM_BOT_TOKEN qo‘ysin" });
+    const botUsername = await resolveProopexBotUsername();
+    if (!isTelegramConfigured() || !botUsername) {
+      res.status(503).json({
+        error: "Telegram PROOPEX boti sozlanmagan. @vaksinahrbot bu platformada ishlatilmaydi.",
+      });
       return;
     }
 
@@ -107,23 +115,16 @@ router.post("/auth/trial/telegram/link", async (req, res): Promise<void> => {
   }
 });
 
-/** Eski deep-link start (moslik uchun) */
+/** Eski deep-link — faqat PROOPEX boti bilan */
 router.post("/auth/trial/telegram/start", async (_req, res): Promise<void> => {
   try {
-    if (!isTelegramConfigured()) {
-      res.status(503).json({ error: "Telegram bot sozlanmagan — keyinroq qayta urinib ko‘ring" });
+    const botUsername = await resolveProopexBotUsername();
+    if (!isTelegramConfigured() || !botUsername || isForbiddenTelegramBot(botUsername)) {
+      res.status(503).json({
+        error: "Telegram PROOPEX boti sozlanmagan. @vaksinahrbot ishlatilmaydi.",
+      });
       return;
     }
-    let botUsername = String(process.env.TELEGRAM_BOT_USERNAME || "").trim().replace(/^@/, "");
-    if (!botUsername) {
-      try {
-        const me = await getMe();
-        botUsername = String(me.username || "").trim();
-      } catch (err) {
-        console.error("[trial-tg] getMe:", err);
-      }
-    }
-    if (!botUsername) botUsername = "vaksinahrbot";
 
     const { id: challengeId, startToken } = createTelegramChallenge();
     const botUrl = `https://t.me/${botUsername}?start=trial_${encodeURIComponent(startToken)}`;
@@ -509,25 +510,17 @@ router.post("/auth/trial/complete", async (req, res): Promise<void> => {
   }
 });
 
-/** Google / Telegram (frontend) */
+/** Google / Telegram (frontend) — @vaksinahrbot hech qachon berilmaydi */
 router.get("/auth/trial/config", async (_req, res): Promise<void> => {
   const googleClientId = String(process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || "").trim();
-  let botUsername = String(process.env.TELEGRAM_BOT_USERNAME || "").trim().replace(/^@/, "");
-  if (!botUsername && isTelegramConfigured()) {
-    try {
-      const me = await getMe();
-      botUsername = String(me.username || "").trim();
-    } catch {
-      /* ignore */
-    }
-  }
-  if (!botUsername) botUsername = "vaksinahrbot";
+  const botUsername = await resolveProopexBotUsername();
+  const telegramOk = Boolean(isTelegramConfigured() && botUsername);
   res.json({
     googleClientId: googleClientId || null,
     phonePrefix: "+998",
     trialDays: 7,
-    telegramConfigured: isTelegramConfigured(),
-    botUsername: `@${botUsername}`,
+    telegramConfigured: telegramOk,
+    botUsername: telegramOk && botUsername ? `@${botUsername}` : null,
   });
 });
 

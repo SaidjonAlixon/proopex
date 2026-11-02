@@ -207,8 +207,9 @@ function LinkButtons({ links }: { links: HelpLink[] }) {
 
 export const HELP_ASSISTANT_ENABLED = AI_CHAT_ENABLED;
 
-export const HELP_CHAT_URL = "https://vaksinahr.uz/yordam";
-export const HELP_BOT_URL = "https://t.me/vaksinahrbot";
+export const HELP_CHAT_URL = "https://proopex.uz/yordam";
+/** @vaksinahrbot PROOPEX da ishlatilmaydi — faqat sayt */
+export const HELP_BOT_URL = "https://proopex.uz/login";
 
 function ShareRow() {
   const [copied, setCopied] = useState(false);
