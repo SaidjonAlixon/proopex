@@ -8,6 +8,7 @@ import {
   createGoogleEmailChallenge,
   createPhoneChallenge,
   createTelegramChallenge,
+  createTelegramUsernameChallenge,
   createTelegramVerifiedChallenge,
   findUserByTrialTarget,
   formatUzPhoneDisplay,
@@ -15,9 +16,11 @@ import {
   makeOtpCode,
   maskTelegramTarget,
   normalizeGmail,
+  normalizeTelegramUsername,
   normalizeUzPhone,
   publicAppOrigin,
   shouldExposeDevCode,
+  telegramUsernameTarget,
   verifyChallengeCode,
   verifyChallengeLinkToken,
   verifyGoogleAccessToken,
@@ -38,6 +41,11 @@ import {
   resolveProopexBotUsername,
   verifyTelegramLoginWidget,
 } from "../lib/telegram";
+import {
+  checkTelegramVerificationCode,
+  isTelegramGatewayConfigured,
+  sendTelegramVerificationCode,
+} from "../lib/telegram-gateway";
 
 const router: IRouter = Router();
 
@@ -61,6 +69,100 @@ async function getUserWithDept(userId: number) {
     .where(eq(usersTable.id, userId));
   return user ?? null;
 }
+
+/**
+ * Rasmiy Telegram akkauntini bog‘lash:
+ * Telegramda ochilgan telefon raqami → kod Telegram ilovasiga keladi → platformaga bog‘lanadi.
+ */
+router.post("/auth/trial/telegram/claim", async (req, res): Promise<void> => {
+  try {
+    const usernameRaw = String(req.body?.username || "").trim();
+    const username = usernameRaw ? normalizeTelegramUsername(usernameRaw) : null;
+    if (usernameRaw && !username) {
+      res.status(400).json({
+        error: "Telegram username noto‘g‘ri. Masalan: @ism_familiya (ixtiyoriy)",
+      });
+      return;
+    }
+
+    const phone = normalizeUzPhone(String(req.body?.phone || ""));
+    if (!phone) {
+      res.status(400).json({
+        error: "Telegram akkauntingiz ochilgan raqamni kiriting (+998 …)",
+      });
+      return;
+    }
+
+    if (!isTelegramGatewayConfigured()) {
+      res.status(503).json({
+        error:
+          "Telegram tasdiqlash sozlanmagan. gateway.telegram.org dan TELEGRAM_GATEWAY_TOKEN qo‘ying.",
+      });
+      return;
+    }
+
+    try {
+      if (username) {
+        const byTg = await findUserByTrialTarget("telegram", telegramUsernameTarget(username));
+        if (byTg) {
+          res.status(409).json({ error: "Bu Telegram allaqachon ro‘yxatdan o‘tgan — Kirishga o‘ting" });
+          return;
+        }
+      }
+      const byPhoneTg = await findUserByTrialTarget("telegram", `p:${phone}`);
+      if (byPhoneTg) {
+        res.status(409).json({ error: "Bu Telegram raqami allaqachon ro‘yxatdan o‘tgan — Kirishga o‘ting" });
+        return;
+      }
+      const byPhone = await findUserByTrialTarget("phone", phone);
+      if (byPhone) {
+        res.status(409).json({ error: "Bu raqam allaqachon ro‘yxatdan o‘tgan — Kirishga o‘ting" });
+        return;
+      }
+    } catch (dbErr) {
+      console.error("[trial-tg] claim db:", dbErr);
+      res.status(503).json({ error: "Baza bilan aloqa yo‘q — birozdan keyin qayta urinib ko‘ring" });
+      return;
+    }
+
+    const code = makeOtpCode();
+    const sent = await sendTelegramVerificationCode({ phoneE164Digits: phone, code, ttlSec: 600 });
+    if (!sent.ok) {
+      console.error("[trial-tg] gateway send:", sent.error);
+      res.status(503).json({ error: sent.error });
+      return;
+    }
+
+    const challengeId = createTelegramUsernameChallenge({
+      username,
+      phone,
+      code,
+      gatewayRequestId: sent.requestId,
+    });
+    console.info(
+      `[trial-tg] claim phone=${phone} @${username || "—"} gateway=${sent.requestId.slice(0, 8)}…`,
+    );
+
+    const phoneMasked = formatUzPhoneDisplay(phone).replace(
+      /(\d{2}) (\d{3}) (\d{2}) (\d{2})$/,
+      "$1 *** ** $4",
+    );
+    res.json({
+      challengeId,
+      method: "telegram",
+      verified: false,
+      targetMasked: username ? `@${username}` : phoneMasked,
+      phoneMasked,
+      via: "telegram",
+      expiresInSec: 600,
+      ...(shouldExposeDevCode() ? { devCode: code } : {}),
+      message: "Kod Telegramga yuborildi — ilovadagi xabarni ochib kodni kiriting",
+    });
+  } catch (err) {
+    console.error("[trial-tg] claim:", err);
+    res.status(503).json({ error: "Telegram ulanmadi — qayta urinib ko‘ring" });
+  }
+});
 
 /** Telegram Login Widget — akkauntni ulash (faqat PROOPEX boti) */
 router.post("/auth/trial/telegram/link", async (req, res): Promise<void> => {
@@ -359,7 +461,7 @@ router.post("/auth/trial/google/start", async (req, res): Promise<void> => {
   });
 });
 
-/** OTP tasdiqlash (telefon yoki Gmail email-otp) */
+/** OTP tasdiqlash (Telegram Gateway / telefon / Gmail) */
 router.post("/auth/trial/verify", async (req, res): Promise<void> => {
   const challengeId = String(req.body?.challengeId || "").trim();
   const code = String(req.body?.code || "").trim();
@@ -367,23 +469,53 @@ router.post("/auth/trial/verify", async (req, res): Promise<void> => {
     res.status(400).json({ error: "Kodni kiriting" });
     return;
   }
-  const result = verifyChallengeCode(challengeId, code);
-  if (!result.ok) {
-    res.status(400).json({ error: result.error });
+
+  const existing = getChallenge(challengeId);
+  if (
+    existing?.method === "telegram" &&
+    existing.gatewayRequestId &&
+    !existing.verified
+  ) {
+    const gw = await checkTelegramVerificationCode({
+      requestId: existing.gatewayRequestId,
+      code,
+    });
+    if (!gw.ok) {
+      // Gateway rad etsa — lokal hash (biz yuborgan kod) bilan ham tekshiramiz
+      const local = verifyChallengeCode(challengeId, code);
+      if (!local.ok) {
+        res.status(400).json({ error: gw.error || local.error });
+        return;
+      }
+    } else {
+      existing.verified = true;
+    }
+  } else {
+    const result = verifyChallengeCode(challengeId, code);
+    if (!result.ok) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+  }
+
+  const challenge = getChallenge(challengeId);
+  if (!challenge?.verified) {
+    res.status(400).json({ error: "Kod tasdiqlanmadi" });
     return;
   }
+
   const masked =
-    result.challenge.method === "phone"
-      ? formatUzPhoneDisplay(result.challenge.target)
-      : result.challenge.method === "telegram"
-        ? maskTelegramTarget(result.challenge)
-        : maskGmail(result.challenge.target);
+    challenge.method === "phone"
+      ? formatUzPhoneDisplay(challenge.target)
+      : challenge.method === "telegram"
+        ? maskTelegramTarget(challenge)
+        : maskGmail(challenge.target);
   res.json({
     challengeId,
     verified: true,
-    method: result.challenge.method,
+    method: challenge.method,
     targetMasked: masked,
-    fullName: result.challenge.googleName || result.challenge.telegramName || null,
+    fullName: challenge.googleName || challenge.telegramName || null,
     message: "Tasdiqlandi — parol o‘rnating",
   });
 });
@@ -474,9 +606,16 @@ router.post("/auth/trial/complete", async (req, res): Promise<void> => {
     challenge.method === "telegram"
       ? challenge.telegramUsername
         ? `@${challenge.telegramUsername}`
-        : `tg_${challenge.target}`
+        : challenge.phone
+          ? `+${challenge.phone}`
+          : `tg_${challenge.target}`
       : challenge.target;
-  const phone = challenge.method === "phone" ? challenge.target : null;
+  const phone =
+    challenge.method === "phone"
+      ? challenge.target
+      : challenge.method === "telegram" && challenge.phone
+        ? challenge.phone
+        : null;
   const telegramId = challenge.method === "telegram" ? challenge.target : null;
 
   try {
@@ -510,17 +649,20 @@ router.post("/auth/trial/complete", async (req, res): Promise<void> => {
   }
 });
 
-/** Google / Telegram (frontend) */
+/** Google / Telegram (frontend) — botsiz Telegram doim yoqilgan */
 router.get("/auth/trial/config", async (_req, res): Promise<void> => {
   const googleClientId = String(process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || "").trim();
   const botUsername = await resolveProopexBotUsername();
-  const telegramOk = Boolean(isTelegramConfigured() && botUsername);
+  const botOk = Boolean(isTelegramConfigured() && botUsername && !isForbiddenTelegramBot(botUsername));
   res.json({
     googleClientId: googleClientId || null,
     phonePrefix: "+998",
     trialDays: 7,
-    telegramConfigured: telegramOk,
-    botUsername: telegramOk && botUsername ? `@${botUsername}` : null,
+    /** Telegram Gateway orqali raqam → Telegram ichida kod */
+    telegramConfigured: true,
+    telegramManual: true,
+    telegramGateway: isTelegramGatewayConfigured(),
+    botUsername: botOk && botUsername ? `@${botUsername}` : null,
   });
 });
 

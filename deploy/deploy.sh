@@ -39,7 +39,8 @@ echo "    commit: $(git log --oneline -1)"
 
 echo "==> pnpm install"
 export CI=true
-pnpm install --frozen-lockfile --prod=false || pnpm install --no-frozen-lockfile --prod=false
+pnpm install --frozen-lockfile --prod=false --config.confirmModulesPurge=false \
+  || pnpm install --no-frozen-lockfile --prod=false --config.confirmModulesPurge=false
 
 echo "==> Frontend build (eski versiya build tugaguncha ishlab turadi)"
 FRONT_DIR="artifacts/vaksina-hr/dist"

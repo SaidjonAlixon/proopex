@@ -5,13 +5,14 @@ import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { useToast } from '../../hooks/use-toast';
 import {
+  claimTelegramTrial,
   completeTrial,
   fetchTrialConfig,
-  linkTelegramTrial,
+  formatUzPhoneInput,
   startGoogleTrial,
+  uzPhoneToE164,
   verifyTrialCode,
   verifyTrialLink,
-  type TelegramLoginPayload,
   type TrialMethod,
 } from '../../lib/trial-auth-api';
 import { cn } from '../../lib/utils';
@@ -27,7 +28,6 @@ type GoogleTokenClient = {
 
 declare global {
   interface Window {
-    onTelegramAuth?: (user: TelegramLoginPayload) => void;
     google?: {
       accounts: {
         id: {
@@ -80,8 +80,8 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
   const [verifyLink, setVerifyLink] = useState<string | null>(null);
   const [emailSent, setEmailSent] = useState(false);
   const [targetMasked, setTargetMasked] = useState('');
-  const [botUsername, setBotUsername] = useState<string | null>(null);
-  const [telegramReady, setTelegramReady] = useState(false);
+  const [tgUsername, setTgUsername] = useState('');
+  const [tgPhoneLocal, setTgPhoneLocal] = useState('');
   const [fullName, setFullName] = useState('');
   const [password, setPassword] = useState('');
   const [password2, setPassword2] = useState('');
@@ -90,71 +90,44 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
   const [googleClientId, setGoogleClientId] = useState<string | null>(null);
   const tokenClientRef = useRef<GoogleTokenClient | null>(null);
   const linkHandledRef = useRef(false);
-  const tgWidgetRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const fromVite = String(import.meta.env.VITE_GOOGLE_CLIENT_ID || '').trim();
     void fetchTrialConfig().then((c) => {
       setGoogleClientId(c.googleClientId || fromVite || null);
-      const raw = String(c.botUsername || '')
-        .trim()
-        .replace(/^@/, '')
-        .toLowerCase();
-      const blocked = raw === 'vaksinahrbot';
-      const okBot = Boolean(c.telegramConfigured && raw && !blocked);
-      setBotUsername(okBot ? raw : null);
-      setTelegramReady(okBot);
     });
   }, []);
 
-  const finishTelegramLink = useCallback(
-    async (user: TelegramLoginPayload) => {
-      setMethod('telegram');
-      setPending(true);
-      try {
-        const res = await linkTelegramTrial(user);
-        setChallengeId(res.challengeId);
-        setTargetMasked(res.targetMasked);
-        if (res.fullName) setFullName(res.fullName);
-        setStep('password');
-        toast({ title: 'Telegram ulandi', description: res.message });
-      } catch (err) {
-        toast({ title: 'Telegram', description: (err as Error).message, variant: 'destructive' });
-      } finally {
-        setPending(false);
-      }
-    },
-    [toast],
-  );
-
-  /** Rasmiy Telegram Login Widget — faqat PROOPEX boti */
-  useEffect(() => {
-    if (step !== 'method' || !telegramReady || !botUsername) return;
-    const host = tgWidgetRef.current;
-    if (!host) return;
-
-    window.onTelegramAuth = (user) => {
-      void finishTelegramLink(user);
-    };
-
-    host.innerHTML = '';
-    const script = document.createElement('script');
-    script.async = true;
-    script.src = 'https://telegram.org/js/telegram-widget.js?22';
-    script.setAttribute('data-telegram-login', botUsername);
-    script.setAttribute('data-size', 'large');
-    script.setAttribute('data-radius', '12');
-    script.setAttribute('data-request-access', 'write');
-    script.setAttribute('data-userpic', 'false');
-    script.setAttribute('data-lang', 'uz');
-    script.setAttribute('data-onauth', 'onTelegramAuth(user)');
-    host.appendChild(script);
-
-    return () => {
-      if (window.onTelegramAuth) delete window.onTelegramAuth;
-      host.innerHTML = '';
-    };
-  }, [step, botUsername, telegramReady, finishTelegramLink]);
+  const startTelegramClaim = async () => {
+    const username = tgUsername.trim().replace(/^@+/, '');
+    const phone = uzPhoneToE164(tgPhoneLocal);
+    if (phone.length !== 12) {
+      toast({
+        title: 'Telegram raqami',
+        description: 'Telegram akkauntingiz ochilgan raqamni kiriting (90 123 45 67)',
+        variant: 'destructive',
+      });
+      return;
+    }
+    setMethod('telegram');
+    setPending(true);
+    try {
+      const res = await claimTelegramTrial({
+        username: username.length >= 5 ? username : undefined,
+        phone,
+      });
+      setChallengeId(res.challengeId);
+      setTargetMasked(res.targetMasked);
+      setDevCode(res.devCode || null);
+      setOtp('');
+      setStep('otp');
+      toast({ title: 'Telegram', description: res.message });
+    } catch (err) {
+      toast({ title: 'Telegram', description: (err as Error).message, variant: 'destructive' });
+    } finally {
+      setPending(false);
+    }
+  };
 
   /** Gmail havolasi: ?verify=token yoki server redirect ?verified=challengeId */
   useEffect(() => {
@@ -379,36 +352,68 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
             </span>
           </button>
 
-          {telegramReady && botUsername ? (
-            <>
-              <div className="trial-or" role="separator">
-                <span>yoki</span>
-              </div>
+          <div className="trial-or" role="separator">
+            <span>yoki</span>
+          </div>
 
-              <div className="trial-tg-card">
-                <div className="trial-tg-card-head">
-                  <TelegramGlyph className="trial-tg-ico trial-tg-ico--lg" />
-                  <div>
-                    <div className="trial-tg-card-title">Telegram akkauntini ulash</div>
-                    <div className="trial-tg-card-hint">Telegram orqali tasdiqlang</div>
+          <div className="trial-tg-card">
+            <div className="trial-tg-card-head">
+              <TelegramGlyph className="trial-tg-ico trial-tg-ico--lg" />
+              <div>
+                <div className="trial-tg-card-title">Telegram orqali ro‘yxat</div>
+                <div className="trial-tg-card-hint">Raqamga Telegramdan kod keladi</div>
+              </div>
+            </div>
+            <p className="trial-tg-help">
+              Telegram akkauntingiz ochilgan telefon raqamini kiriting. Kod SMS emas — Telegram ilovasiga xabar
+              bo‘lib keladi. Shu bilan akkaunt platformaga bog‘lanadi.
+            </p>
+            <div className="space-y-2.5">
+              <div className="space-y-1.5">
+                <Label htmlFor="trial-tg-phone">Telegram raqami</Label>
+                <div className="flex gap-2">
+                  <div className="flex h-10 shrink-0 items-center rounded-md border bg-muted/40 px-3 text-sm font-medium text-muted-foreground">
+                    +998
                   </div>
-                </div>
-                <p className="trial-tg-help">
-                  «Log in with Telegram» tugmasini bosing, akkauntingizni tanlang, keyin saytda parol o‘rnating.
-                </p>
-                <div className="trial-tg-widget-wrap" aria-busy={pending}>
-                  {pending ? (
-                    <div className="flex items-center justify-center gap-2 py-3 text-sm text-sky-800 dark:text-sky-100">
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      Telegram ulanmoqda…
-                    </div>
-                  ) : (
-                    <div ref={tgWidgetRef} className="trial-tg-widget" />
-                  )}
+                  <Input
+                    id="trial-tg-phone"
+                    inputMode="numeric"
+                    autoComplete="tel-national"
+                    placeholder="90 123 45 67"
+                    value={tgPhoneLocal}
+                    onChange={(e) => setTgPhoneLocal(formatUzPhoneInput(e.target.value))}
+                  />
                 </div>
               </div>
-            </>
-          ) : null}
+              <div className="space-y-1.5">
+                <Label htmlFor="trial-tg-user">
+                  Username <span className="font-normal text-muted-foreground">(ixtiyoriy)</span>
+                </Label>
+                <div className="relative">
+                  <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm font-semibold text-sky-600">
+                    @
+                  </span>
+                  <Input
+                    id="trial-tg-user"
+                    autoComplete="username"
+                    placeholder="ism_familiya"
+                    className="pl-7"
+                    value={tgUsername}
+                    onChange={(e) => setTgUsername(e.target.value.replace(/^@+/, '').replace(/\s/g, ''))}
+                  />
+                </div>
+              </div>
+              <Button
+                type="button"
+                className="login-proopex-submit w-full"
+                disabled={pending}
+                onClick={() => void startTelegramClaim()}
+              >
+                {pending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Telegramga kod yuborish
+              </Button>
+            </div>
+          </div>
         </div>
       ) : null}
 
@@ -417,18 +422,22 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
           <div className="flex items-start gap-2 rounded-xl border border-emerald-200/70 bg-emerald-50/80 px-3 py-2.5 text-sm text-emerald-900 dark:border-emerald-500/30 dark:bg-emerald-950/40 dark:text-emerald-100">
             <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
             <div>
-              <div className="font-semibold">Gmailni tasdiqlang</div>
+              <div className="font-semibold">
+                {method === 'telegram' ? 'Telegramni tasdiqlang' : 'Gmailni tasdiqlang'}
+              </div>
               <div className="text-xs opacity-90">
-                {emailSent
-                  ? `${targetMasked} ga kod va havola yuborildi — kodni kiriting yoki Gmaildagi havolani bosing`
-                  : `${targetMasked} — kodni kiriting yoki havolani oching`}
+                {method === 'telegram'
+                  ? `${targetMasked} — Telegram ilovasiga kelgan kodni kiriting`
+                  : emailSent
+                    ? `${targetMasked} ga kod va havola yuborildi — kodni kiriting yoki Gmaildagi havolani bosing`
+                    : `${targetMasked} — kodni kiriting yoki havolani oching`}
               </div>
               {devCode ? (
                 <div className="mt-1 rounded-md bg-white/70 px-2 py-1 font-mono text-xs dark:bg-black/30">
                   Kod: <strong>{devCode}</strong>
                 </div>
               ) : null}
-              {verifyLink ? (
+              {method !== 'telegram' && verifyLink ? (
                 <a
                   href={verifyLink}
                   className="mt-2 inline-block text-xs font-semibold underline underline-offset-2"

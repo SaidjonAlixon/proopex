@@ -18,6 +18,10 @@ type TrialChallenge = {
   startToken?: string;
   telegramUsername?: string;
   telegramName?: string;
+  /** Telegram raqami (Gateway / bog‘lash) */
+  phone?: string;
+  /** Telegram Gateway request_id */
+  gatewayRequestId?: string;
   expiresAt: number;
   attempts: number;
 };
@@ -134,6 +138,51 @@ export function createTelegramVerifiedChallenge(tg: {
     verified: true,
     telegramUsername: tg.username ? String(tg.username).replace(/^@/, "") : undefined,
     telegramName: name || undefined,
+    expiresAt: Date.now() + CODE_TTL_MS,
+    attempts: 0,
+  });
+  return id;
+}
+
+/** @username normalizatsiya — botsiz ulash */
+export function normalizeTelegramUsername(raw: string): string | null {
+  const u = String(raw || "")
+    .trim()
+    .replace(/^@+/, "")
+    .toLowerCase();
+  if (!/^[a-z][a-z0-9_]{4,31}$/.test(u)) return null;
+  if (u === "proopexbot") return null;
+  return u;
+}
+
+/** Telegram target kaliti (bot ID o‘rniga username) */
+export function telegramUsernameTarget(username: string) {
+  return `u:${username.toLowerCase()}`;
+}
+
+/**
+ * Telegram raqam + ixtiyoriy @username.
+ * Kod Telegram Gateway orqali shu raqamdagi akkauntga yuboriladi.
+ * telegramId: `u:username` yoki `p:phone`
+ */
+export function createTelegramUsernameChallenge(opts: {
+  username?: string | null;
+  phone: string;
+  code: string;
+  gatewayRequestId?: string;
+}) {
+  pruneExpired();
+  const id = newId();
+  const username = opts.username ? opts.username.toLowerCase() : undefined;
+  challenges.set(id, {
+    id,
+    method: "telegram",
+    target: username ? telegramUsernameTarget(username) : `p:${opts.phone}`,
+    codeHash: hashCode(opts.code),
+    verified: false,
+    telegramUsername: username,
+    phone: opts.phone,
+    gatewayRequestId: opts.gatewayRequestId,
     expiresAt: Date.now() + CODE_TTL_MS,
     attempts: 0,
   });
@@ -308,7 +357,8 @@ export async function findUserByTrialTarget(method: TrialMethod, target: string)
       .where(eq(usersTable.telegramId, tgId))
       .limit(1);
     if (byTg) return byTg;
-    const loginCandidates = [`tg_${tgId}`, `@${tgId}`];
+    const uname = tgId.startsWith("u:") ? tgId.slice(2) : tgId.replace(/^@/, "");
+    const loginCandidates = [`tg_${tgId}`, `@${uname}`, uname];
     const [byLoginTg] = await db
       .select()
       .from(usersTable)
@@ -316,6 +366,7 @@ export async function findUserByTrialTarget(method: TrialMethod, target: string)
         or(
           eq(usersTable.login, loginCandidates[0]!),
           sql`lower(${usersTable.login}) = lower(${loginCandidates[1]!})`,
+          sql`lower(${usersTable.login}) = lower(${loginCandidates[2]!})`,
         ),
       )
       .limit(1);

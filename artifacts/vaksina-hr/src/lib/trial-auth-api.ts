@@ -23,7 +23,8 @@ export async function fetchTrialConfig() {
       googleClientId: null as string | null,
       phonePrefix: '+998',
       trialDays: 7,
-      telegramConfigured: false,
+      telegramConfigured: true,
+      telegramManual: true,
       botUsername: null as string | null,
     };
   }
@@ -32,6 +33,7 @@ export async function fetchTrialConfig() {
     phonePrefix: string;
     trialDays: number;
     telegramConfigured?: boolean;
+    telegramManual?: boolean;
     botUsername?: string | null;
   };
 }
@@ -55,7 +57,21 @@ export type TelegramLoginPayload = {
   hash: string;
 };
 
-/** Telegram Login Widget — akkaunt ulash */
+/** Telegram raqami → Gateway orqali Telegramga kod → akkaunt bog‘lash */
+export function claimTelegramTrial(opts: { username?: string; phone: string }) {
+  return postJson<{
+    challengeId: string;
+    verified: boolean;
+    targetMasked: string;
+    phoneMasked?: string;
+    via?: string;
+    fullName?: string | null;
+    devCode?: string;
+    message: string;
+  }>('/auth/trial/telegram/claim', opts);
+}
+
+/** Telegram Login Widget — akkaunt ulash (ixtiyoriy bot) */
 export function linkTelegramTrial(auth: TelegramLoginPayload) {
   return postJson<{
     challengeId: string;

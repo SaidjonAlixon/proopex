@@ -90,13 +90,25 @@ function botToken(): string | null {
   return t || null;
 }
 
-/** Boshqa loyiha botlari — PROOPEX da ulanmaydi */
-export function isForbiddenTelegramBot(username?: string | null): boolean {
-  const u = String(username || "")
+/** PROOPEX rasmiy Telegram boti */
+export const PROOPEX_BOT_USERNAME = "proopexbot";
+
+function normBotUsername(username?: string | null): string {
+  return String(username || "")
     .trim()
     .replace(/^@/, "")
     .toLowerCase();
-  return u === "vaksinahrbot";
+}
+
+/** Faqat @proopexbot ruxsat — boshqa botlar ulanmaydi */
+export function isForbiddenTelegramBot(username?: string | null): boolean {
+  const u = normBotUsername(username);
+  if (!u) return true;
+  return u !== PROOPEX_BOT_USERNAME;
+}
+
+export function isProopexBotUsername(username?: string | null): boolean {
+  return normBotUsername(username) === PROOPEX_BOT_USERNAME;
 }
 
 export function isTelegramConfigured(): boolean {
@@ -306,22 +318,21 @@ export async function getMe() {
   return tgCall<{ id: number; username?: string; first_name?: string }>("getMe", {});
 }
 
-/** PROOPEX uchun bot username (taqiqlangan botlar null) */
+/** PROOPEX uchun bot username — faqat @proopexbot */
 export async function resolveProopexBotUsername(): Promise<string | null> {
-  const fromEnv = String(process.env.TELEGRAM_BOT_USERNAME || "")
-    .trim()
-    .replace(/^@/, "");
-  if (fromEnv) {
-    return isForbiddenTelegramBot(fromEnv) ? null : fromEnv;
-  }
-  if (!botToken()) return null;
+  const envName = normBotUsername(process.env.TELEGRAM_BOT_USERNAME || PROOPEX_BOT_USERNAME);
+  if (!isProopexBotUsername(envName)) return null;
+
+  if (!botToken()) return PROOPEX_BOT_USERNAME;
+
   try {
     const me = await getMe();
-    const u = String(me.username || "").trim();
-    if (!u || isForbiddenTelegramBot(u)) return null;
-    return u;
+    const u = normBotUsername(me.username);
+    // Token boshqa botga tegishli bo‘lsa — rad
+    if (u && !isProopexBotUsername(u)) return null;
+    return PROOPEX_BOT_USERNAME;
   } catch {
-    return null;
+    return PROOPEX_BOT_USERNAME;
   }
 }
 
