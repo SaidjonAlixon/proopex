@@ -32,7 +32,6 @@ import { takeAfterLogin } from '../lib/conference/api';
 import { fetchFaceIdStatus } from '../lib/face-id';
 import { TrialLoginFields, TrialRegisterPanel } from '../components/auth/TrialRegisterPanel';
 import type { TrialMethod } from '../lib/trial-auth-api';
-import { uzPhoneToE164 } from '../lib/trial-auth-api';
 
 type DeviceGate =
   | null
@@ -146,11 +145,15 @@ export default function Login() {
   };
 
   const resolveLoginId = () => {
-    if (loginMethod === 'phone') {
-      const e164 = uzPhoneToE164(login);
-      return e164 || compactCredential(login);
+    const raw = compactCredential(login);
+    if (loginMethod === 'telegram') {
+      if (/^tg_\d+$/i.test(raw)) return raw;
+      if (!raw.includes('@gmail.') && !raw.includes('@')) {
+        return `@${raw.replace(/^@/, '')}`;
+      }
+      return raw.startsWith('@') ? raw : `@${raw}`;
     }
-    return compactCredential(login).toLowerCase();
+    return raw.toLowerCase();
   };
 
   const handleLogin = async (e?: React.FormEvent) => {

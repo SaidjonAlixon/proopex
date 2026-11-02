@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomInt } from "crypto";
 import { eq, or, sql } from "drizzle-orm";
 import { db, usersTable } from "@workspace/db";
 
-export type TrialMethod = "phone" | "google";
+export type TrialMethod = "phone" | "google" | "telegram";
 
 type TrialChallenge = {
   id: string;
@@ -14,6 +14,10 @@ type TrialChallenge = {
   googleName?: string;
   /** Magic link token (Gmail havolasi) */
   linkToken?: string;
+  /** Bot /start payload (Telegram trial) */
+  startToken?: string;
+  telegramUsername?: string;
+  telegramName?: string;
   expiresAt: number;
   attempts: number;
 };
@@ -21,6 +25,8 @@ type TrialChallenge = {
 const challenges = new Map<string, TrialChallenge>();
 /** linkToken → challengeId */
 const linkIndex = new Map<string, string>();
+/** startToken → challengeId (Telegram bot deep-link) */
+const telegramStartIndex = new Map<string, string>();
 const CODE_TTL_MS = 10 * 60 * 1000;
 const MAX_ATTEMPTS = 8;
 
@@ -38,6 +44,7 @@ function pruneExpired() {
     if (c.expiresAt <= now) {
       challenges.delete(id);
       if (c.linkToken) linkIndex.delete(c.linkToken);
+      if (c.startToken) telegramStartIndex.delete(c.startToken);
     }
   }
 }
@@ -87,6 +94,56 @@ export function createPhoneChallenge(phone: string, code: string) {
     attempts: 0,
   });
   return id;
+}
+
+/** Telegram bot deep-link: saytda challenge yaratiladi, botda /start trial_<token> bilan tasdiqlanadi */
+export function createTelegramChallenge() {
+  pruneExpired();
+  const id = newId();
+  const startToken = newId().slice(0, 24);
+  challenges.set(id, {
+    id,
+    method: "telegram",
+    target: "",
+    codeHash: hashCode(startToken),
+    verified: false,
+    startToken,
+    expiresAt: Date.now() + CODE_TTL_MS,
+    attempts: 0,
+  });
+  telegramStartIndex.set(startToken, id);
+  return { id, startToken };
+}
+
+export function confirmTelegramChallenge(
+  startToken: string,
+  tg: { id: number | string; username?: string; firstName?: string; lastName?: string },
+): { ok: true; challenge: TrialChallenge } | { ok: false; error: string } {
+  pruneExpired();
+  const token = String(startToken || "").trim();
+  if (!token) return { ok: false, error: "Token yo‘q" };
+  const id = telegramStartIndex.get(token);
+  if (!id) return { ok: false, error: "Havola yaroqsiz yoki muddati tugagan" };
+  const c = getChallenge(id);
+  if (!c || c.method !== "telegram") {
+    telegramStartIndex.delete(token);
+    return { ok: false, error: "Havola muddati tugagan — saytdan qayta boshlang" };
+  }
+  const tgId = String(tg.id || "").trim();
+  if (!tgId) return { ok: false, error: "Telegram foydalanuvchi topilmadi" };
+  const name = [tg.firstName, tg.lastName].filter(Boolean).join(" ").trim();
+  c.target = tgId;
+  c.telegramUsername = tg.username ? String(tg.username).replace(/^@/, "") : undefined;
+  c.telegramName = name || undefined;
+  c.verified = true;
+  return { ok: true, challenge: c };
+}
+
+export function maskTelegramTarget(c: Pick<TrialChallenge, "telegramUsername" | "telegramName" | "target">) {
+  if (c.telegramUsername) return `@${c.telegramUsername}`;
+  if (c.telegramName) return c.telegramName;
+  if (c.target) return `Telegram ···${String(c.target).slice(-4)}`;
+  return "Telegram";
 }
 
 export function createGoogleEmailChallenge(
@@ -176,15 +233,36 @@ export function consumeChallenge(id: string) {
   if (!c) return null;
   challenges.delete(id);
   if (c.linkToken) linkIndex.delete(c.linkToken);
+  if (c.startToken) telegramStartIndex.delete(c.startToken);
   return c;
 }
 
+function isLocalOrigin(url: string) {
+  try {
+    const u = new URL(url);
+    return u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]";
+  } catch {
+    return /localhost|127\.0\.0\.1/i.test(url);
+  }
+}
+
+/**
+ * Email/Telegram havolalari uchun — avvalo PUBLIC_APP_URL (proopex.uz).
+ * Localhost origin emailga tushmasin.
+ */
 export function publicAppOrigin(reqOrigin?: string | null) {
-  const fromReq = String(reqOrigin || "").trim().replace(/\/$/, "");
-  if (fromReq && /^https?:\/\//i.test(fromReq)) return fromReq;
   const fromEnv = String(process.env.PUBLIC_APP_URL || "").trim().replace(/\/$/, "");
-  if (fromEnv) return fromEnv;
-  return "http://localhost:3000";
+  const fromReq = String(reqOrigin || "").trim().replace(/\/$/, "");
+
+  if (fromEnv && /^https?:\/\//i.test(fromEnv) && !isLocalOrigin(fromEnv)) {
+    return fromEnv;
+  }
+  if (fromReq && /^https?:\/\//i.test(fromReq) && !isLocalOrigin(fromReq)) {
+    return fromReq;
+  }
+  if (fromEnv && /^https?:\/\//i.test(fromEnv)) return fromEnv;
+  if (fromReq && /^https?:\/\//i.test(fromReq)) return fromReq;
+  return "https://proopex.uz";
 }
 
 export async function findUserByTrialTarget(method: TrialMethod, target: string) {
@@ -195,6 +273,29 @@ export async function findUserByTrialTarget(method: TrialMethod, target: string)
       .where(or(eq(usersTable.phone, target), eq(usersTable.login, target), eq(usersTable.login, `+${target}`)))
       .limit(1);
     if (byPhone) return byPhone;
+  }
+  if (method === "telegram") {
+    const tgId = String(target || "").trim();
+    if (!tgId) return null;
+    const [byTg] = await db
+      .select()
+      .from(usersTable)
+      .where(eq(usersTable.telegramId, tgId))
+      .limit(1);
+    if (byTg) return byTg;
+    const loginCandidates = [`tg_${tgId}`, `@${tgId}`];
+    const [byLoginTg] = await db
+      .select()
+      .from(usersTable)
+      .where(
+        or(
+          eq(usersTable.login, loginCandidates[0]!),
+          sql`lower(${usersTable.login}) = lower(${loginCandidates[1]!})`,
+        ),
+      )
+      .limit(1);
+    if (byLoginTg) return byLoginTg;
+    return null;
   }
   const [byLogin] = await db
     .select()

@@ -47,10 +47,12 @@ function LegalContent({ doc }: { doc: LegalDoc }) {
   return (
     <article id="landing-legal-top" className="landing-legal" tabIndex={-1}>
       <header className="landing-legal-head">
-        <Link href="/" className="landing-legal-back">
-          <ArrowLeft className="h-4 w-4" aria-hidden />
-          Bosh sahifa
-        </Link>
+        <div className="landing-legal-nav">
+          <Link href="/" className="landing-legal-back">
+            <ArrowLeft className="h-4 w-4" aria-hidden />
+            Bosh sahifa
+          </Link>
+        </div>
         <p className="landing-eyebrow landing-legal-eyebrow">
           <Icon className="h-3.5 w-3.5" aria-hidden />
           {doc.eyebrow}

@@ -7,10 +7,12 @@ import {
   consumeChallenge,
   createGoogleEmailChallenge,
   createPhoneChallenge,
+  createTelegramChallenge,
   findUserByTrialTarget,
   formatUzPhoneDisplay,
   getChallenge,
   makeOtpCode,
+  maskTelegramTarget,
   normalizeGmail,
   normalizeUzPhone,
   publicAppOrigin,
@@ -29,6 +31,7 @@ import {
   sendEskizSms,
 } from "../lib/eskiz-sms";
 import { sendTrialVerifyEmail } from "../lib/trial-email";
+import { getMe, isTelegramConfigured } from "../lib/telegram";
 
 const router: IRouter = Router();
 
@@ -53,7 +56,84 @@ async function getUserWithDept(userId: number) {
   return user ?? null;
 }
 
-/** Telefon OTP yuborish */
+/** Telegram bot deep-link — ro‘yxatdan o‘tish */
+router.post("/auth/trial/telegram/start", async (_req, res): Promise<void> => {
+  try {
+    if (!isTelegramConfigured()) {
+      res.status(503).json({ error: "Telegram bot sozlanmagan — keyinroq qayta urinib ko‘ring" });
+      return;
+    }
+    let botUsername = String(process.env.TELEGRAM_BOT_USERNAME || "").trim().replace(/^@/, "");
+    if (!botUsername) {
+      try {
+        const me = await getMe();
+        botUsername = String(me.username || "").trim();
+      } catch (err) {
+        console.error("[trial-tg] getMe:", err);
+      }
+    }
+    if (!botUsername) botUsername = "vaksinahrbot";
+
+    const { id: challengeId, startToken } = createTelegramChallenge();
+    const botUrl = `https://t.me/${botUsername}?start=trial_${encodeURIComponent(startToken)}`;
+    res.json({
+      challengeId,
+      method: "telegram",
+      botUsername: `@${botUsername}`,
+      botUrl,
+      expiresInSec: 600,
+      message: "Telegramda Start bosing — keyin saytda parol o‘rnating",
+    });
+  } catch (err) {
+    console.error("[trial-tg] start:", err);
+    res.status(503).json({ error: "Telegram sessiyasi ochilmadi" });
+  }
+});
+
+/** Telegram tasdiq holati (frontend poll) */
+router.get("/auth/trial/telegram/status", async (req, res): Promise<void> => {
+  const challengeId = String(req.query?.challengeId || "").trim();
+  if (!challengeId) {
+    res.status(400).json({ error: "challengeId kerak" });
+    return;
+  }
+  const challenge = getChallenge(challengeId);
+  if (!challenge || challenge.method !== "telegram") {
+    res.status(400).json({ error: "Sessiya topilmadi yoki muddati tugagan" });
+    return;
+  }
+  if (!challenge.verified || !challenge.target) {
+    res.json({
+      challengeId,
+      verified: false,
+      pending: true,
+      message: "Telegramda Start tugmasini bosing",
+    });
+    return;
+  }
+
+  try {
+    const existing = await findUserByTrialTarget("telegram", challenge.target);
+    if (existing) {
+      consumeChallenge(challengeId);
+      res.status(409).json({ error: "Bu Telegram allaqachon ro‘yxatdan o‘tgan — Kirishga o‘ting" });
+      return;
+    }
+  } catch (err) {
+    console.error("[trial-tg] status db:", err);
+  }
+
+  res.json({
+    challengeId,
+    verified: true,
+    method: "telegram",
+    targetMasked: maskTelegramTarget(challenge),
+    fullName: challenge.telegramName || null,
+    message: "Telegram tasdiqlandi — parol o‘rnating",
+  });
+});
+
+/** Telefon OTP yuborish (eski API — UI Telegramga o‘tdi) */
 router.post("/auth/trial/phone/start", async (req, res): Promise<void> => {
   try {
     const phone = normalizeUzPhone(String(req.body?.phone || ""));
@@ -134,7 +214,10 @@ router.post("/auth/trial/google/start", async (req, res): Promise<void> => {
   const idToken = String(req.body?.idToken || "").trim();
   const accessToken = String(req.body?.accessToken || "").trim();
   const emailRaw = String(req.body?.email || "").trim();
-  const origin = publicAppOrigin(String(req.headers.origin || "") || null);
+  // Email havolasi doim domen (PUBLIC_APP_URL / proopex.uz) — localhost emas
+  const origin = publicAppOrigin(
+    String(req.headers.origin || req.headers.referer || "") || null,
+  );
 
   if (idToken || accessToken) {
     try {
@@ -156,8 +239,9 @@ router.post("/auth/trial/google/start", async (req, res): Promise<void> => {
         sub: verified.sub,
         name: verified.name,
       });
-      const verifyLink = `${origin}/login?mode=register&verify=${encodeURIComponent(linkToken)}`;
-      console.info(`[trial-otp] gmail=${verified.email} code=${code} link=${linkToken.slice(0, 8)}…`);
+      // Emaildagi havola — real domen orqali API redirect (proopex.uz)
+      const verifyLink = `${origin}/api/auth/trial/verify-link?token=${encodeURIComponent(linkToken)}`;
+      console.info(`[trial-otp] gmail=${verified.email} code=${code} origin=${origin} link=${linkToken.slice(0, 8)}…`);
 
       // Haqiqiy xat: SMTP (Gmail App Password) yoki Resend
       const sent = await sendTrialVerifyEmail({
@@ -208,8 +292,8 @@ router.post("/auth/trial/google/start", async (req, res): Promise<void> => {
 
   const code = makeOtpCode();
   const { id: challengeId, linkToken } = createGoogleEmailChallenge(email, code);
-  const verifyLink = `${origin}/login?mode=register&verify=${encodeURIComponent(linkToken)}`;
-  console.info(`[trial-otp] gmail=${email} code=${code}`);
+  const verifyLink = `${origin}/api/auth/trial/verify-link?token=${encodeURIComponent(linkToken)}`;
+  console.info(`[trial-otp] gmail=${email} code=${code} origin=${origin}`);
 
   res.json({
     challengeId,
@@ -236,15 +320,18 @@ router.post("/auth/trial/verify", async (req, res): Promise<void> => {
     res.status(400).json({ error: result.error });
     return;
   }
+  const masked =
+    result.challenge.method === "phone"
+      ? formatUzPhoneDisplay(result.challenge.target)
+      : result.challenge.method === "telegram"
+        ? maskTelegramTarget(result.challenge)
+        : maskGmail(result.challenge.target);
   res.json({
     challengeId,
     verified: true,
     method: result.challenge.method,
-    targetMasked:
-      result.challenge.method === "phone"
-        ? formatUzPhoneDisplay(result.challenge.target)
-        : maskGmail(result.challenge.target),
-    fullName: result.challenge.googleName || null,
+    targetMasked: masked,
+    fullName: result.challenge.googleName || result.challenge.telegramName || null,
     message: "Tasdiqlandi — parol o‘rnating",
   });
 });
@@ -324,10 +411,21 @@ router.post("/auth/trial/complete", async (req, res): Promise<void> => {
   const fullName =
     fullNameIn ||
     challenge.googleName ||
-    (challenge.method === "phone" ? `Sinov ${formatUzPhoneDisplay(challenge.target)}` : challenge.target.split("@")[0]);
+    challenge.telegramName ||
+    (challenge.method === "phone"
+      ? `Sinov ${formatUzPhoneDisplay(challenge.target)}`
+      : challenge.method === "telegram"
+        ? maskTelegramTarget(challenge)
+        : challenge.target.split("@")[0]);
 
-  const login = challenge.target;
+  const login =
+    challenge.method === "telegram"
+      ? challenge.telegramUsername
+        ? `@${challenge.telegramUsername}`
+        : `tg_${challenge.target}`
+      : challenge.target;
   const phone = challenge.method === "phone" ? challenge.target : null;
+  const telegramId = challenge.method === "telegram" ? challenge.target : null;
 
   try {
     const [created] = await db
@@ -338,6 +436,7 @@ router.post("/auth/trial/complete", async (req, res): Promise<void> => {
         login,
         password,
         phone,
+        telegramId,
         status: "active",
       })
       .returning({ id: usersTable.id });
@@ -359,13 +458,25 @@ router.post("/auth/trial/complete", async (req, res): Promise<void> => {
   }
 });
 
-/** Google client id (frontend GIS uchun) */
-router.get("/auth/trial/config", (_req, res): void => {
+/** Google / Telegram (frontend) */
+router.get("/auth/trial/config", async (_req, res): Promise<void> => {
   const googleClientId = String(process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || "").trim();
+  let botUsername = String(process.env.TELEGRAM_BOT_USERNAME || "").trim().replace(/^@/, "");
+  if (!botUsername && isTelegramConfigured()) {
+    try {
+      const me = await getMe();
+      botUsername = String(me.username || "").trim();
+    } catch {
+      /* ignore */
+    }
+  }
+  if (!botUsername) botUsername = "vaksinahrbot";
   res.json({
     googleClientId: googleClientId || null,
     phonePrefix: "+998",
     trialDays: 7,
+    telegramConfigured: isTelegramConfigured(),
+    botUsername: `@${botUsername}`,
   });
 });
 

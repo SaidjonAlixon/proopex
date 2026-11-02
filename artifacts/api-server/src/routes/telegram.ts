@@ -35,6 +35,12 @@ import {
   type TelegramUpdate,
 } from "../lib/telegram";
 import {
+  confirmTelegramChallenge,
+  findUserByTrialTarget,
+  maskTelegramTarget,
+  publicAppOrigin,
+} from "../lib/trial-auth";
+import {
   handleGroupSupportMessage,
   handlePrivateSupportMessage,
   isGroupChat,
@@ -468,6 +474,50 @@ async function sendDavomatMiniApp(
   });
 }
 
+async function handleTrialStart(
+  chatId: number,
+  from: { id: number; username?: string; first_name?: string; last_name?: string },
+  startToken: string,
+) {
+  const confirmed = confirmTelegramChallenge(startToken, {
+    id: from.id,
+    username: from.username,
+    firstName: from.first_name,
+    lastName: from.last_name,
+  });
+  if (!confirmed.ok) {
+    await sendMessage(
+      chatId,
+      `⏳ ${escapeHtml(confirmed.error)}\n\nSaytdan qayta «Telegram orqali» tugmasini bosing.`,
+    );
+    return;
+  }
+
+  const existing = await findUserByTrialTarget("telegram", String(from.id));
+  if (existing) {
+    await sendMessage(
+      chatId,
+      `ℹ️ Bu Telegram allaqachon ro‘yxatdan o‘tgan.\nSaytda <b>Kirish</b> orqali kiring.`,
+    );
+    return;
+  }
+
+  const masked = maskTelegramTarget(confirmed.challenge);
+  const origin = publicAppOrigin(publicAppUrl() || null);
+  const continueUrl = `${origin}/login?mode=register&tg=${encodeURIComponent(confirmed.challenge.id)}`;
+  await sendMessage(
+    chatId,
+    `✅ <b>Telegram tasdiqlandi</b>\n\n` +
+      `Akkaunt: <b>${escapeHtml(masked)}</b>\n\n` +
+      `Endi saytda parol o‘rnating va ro‘yxatdan o‘ting.`,
+    {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🌐 Saytda davom etish", url: continueUrl }]],
+      },
+    },
+  );
+}
+
 async function handleStart(chatId: number, fromId: number, firstName?: string) {
   const linked = await findUserByTelegramId(String(fromId));
   if (linked && canSignIn(linked.status)) {
@@ -629,6 +679,11 @@ async function handleUpdate(update: TelegramUpdate) {
   const text = msg.text.trim();
 
   if (text === "/start" || text.startsWith("/start ")) {
+    const payload = text.startsWith("/start ") ? text.slice(7).trim() : "";
+    if (payload.startsWith("trial_")) {
+      await handleTrialStart(chatId, msg.from, payload.slice(6));
+      return;
+    }
     await handleStart(chatId, fromId, msg.from.first_name);
     return;
   }

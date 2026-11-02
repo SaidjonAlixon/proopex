@@ -1,4 +1,4 @@
-export type TrialMethod = 'phone' | 'google';
+export type TrialMethod = 'phone' | 'google' | 'telegram';
 
 type ApiErr = { error?: string; message?: string };
 
@@ -18,11 +18,21 @@ async function postJson<T>(path: string, body: Record<string, unknown>): Promise
 
 export async function fetchTrialConfig() {
   const res = await fetch('/api/auth/trial/config', { credentials: 'include' });
-  if (!res.ok) return { googleClientId: null as string | null, phonePrefix: '+998', trialDays: 7 };
+  if (!res.ok) {
+    return {
+      googleClientId: null as string | null,
+      phonePrefix: '+998',
+      trialDays: 7,
+      telegramConfigured: true,
+      botUsername: '@vaksinahrbot',
+    };
+  }
   return (await res.json()) as {
     googleClientId: string | null;
     phonePrefix: string;
     trialDays: number;
+    telegramConfigured?: boolean;
+    botUsername?: string;
   };
 }
 
@@ -33,6 +43,35 @@ export function startPhoneTrial(phone: string) {
     devCode?: string;
     message: string;
   }>('/auth/trial/phone/start', { phone });
+}
+
+export function startTelegramTrial() {
+  return postJson<{
+    challengeId: string;
+    botUsername: string;
+    botUrl: string;
+    message: string;
+  }>('/auth/trial/telegram/start', {});
+}
+
+export async function pollTelegramTrial(challengeId: string) {
+  const res = await fetch(
+    `/api/auth/trial/telegram/status?challengeId=${encodeURIComponent(challengeId)}`,
+    { credentials: 'include' },
+  );
+  const data = (await res.json().catch(() => ({}))) as {
+    challengeId?: string;
+    verified?: boolean;
+    pending?: boolean;
+    targetMasked?: string;
+    fullName?: string | null;
+    message?: string;
+    error?: string;
+  };
+  if (!res.ok) {
+    throw new Error(data.error || data.message || 'Telegram holati o‘qilmadi');
+  }
+  return data;
 }
 
 export function startGoogleTrial(opts: { idToken?: string; accessToken?: string; email?: string }) {
@@ -77,7 +116,6 @@ export function completeTrial(opts: { challengeId: string; password: string; ful
       role: string;
       login: string;
       phone?: string | null;
-      status?: string;
       [key: string]: unknown;
     };
     message: string;

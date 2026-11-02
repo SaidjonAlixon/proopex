@@ -72,3 +72,9 @@ artifacts/vaksina-hr/dist/
 
 # Local VPS helper scripts (contain host credentials — never commit)
 scripts/_vps_*.py
+scripts/_wait_apt.py
+scripts/vps_bootstrap_from_git.py
+scripts/vps_finish_deploy.py
+scripts/vps_fresh_db_only.py
+scripts/vps_bind_domain.py
+scripts/vps_redeploy_front.py

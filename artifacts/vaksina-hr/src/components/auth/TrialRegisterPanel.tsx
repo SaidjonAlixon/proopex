@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Eye, EyeOff, Loader2, Mail, Phone, ShieldCheck } from 'lucide-react';
+import { Eye, EyeOff, Loader2, Mail, ShieldCheck } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
@@ -7,10 +7,9 @@ import { useToast } from '../../hooks/use-toast';
 import {
   completeTrial,
   fetchTrialConfig,
-  formatUzPhoneInput,
+  pollTelegramTrial,
   startGoogleTrial,
-  startPhoneTrial,
-  uzPhoneToE164,
+  startTelegramTrial,
   verifyTrialCode,
   verifyTrialLink,
   type TrialMethod,
@@ -68,19 +67,20 @@ function loadGoogleScript(): Promise<void> {
   });
 }
 
-type Step = 'method' | 'phone' | 'otp' | 'password';
+type Step = 'method' | 'telegram' | 'otp' | 'password';
 
 export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: TrialUser) => void }) {
   const { toast } = useToast();
   const [step, setStep] = useState<Step>('method');
   const [method, setMethod] = useState<TrialMethod | null>(null);
-  const [phoneLocal, setPhoneLocal] = useState('');
   const [otp, setOtp] = useState('');
   const [challengeId, setChallengeId] = useState('');
   const [devCode, setDevCode] = useState<string | null>(null);
   const [verifyLink, setVerifyLink] = useState<string | null>(null);
   const [emailSent, setEmailSent] = useState(false);
   const [targetMasked, setTargetMasked] = useState('');
+  const [botUrl, setBotUrl] = useState<string | null>(null);
+  const [botUsername, setBotUsername] = useState('@vaksinahrbot');
   const [fullName, setFullName] = useState('');
   const [password, setPassword] = useState('');
   const [password2, setPassword2] = useState('');
@@ -89,21 +89,24 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
   const [googleClientId, setGoogleClientId] = useState<string | null>(null);
   const tokenClientRef = useRef<GoogleTokenClient | null>(null);
   const linkHandledRef = useRef(false);
+  const pollStopRef = useRef(false);
 
   useEffect(() => {
     const fromVite = String(import.meta.env.VITE_GOOGLE_CLIENT_ID || '').trim();
     void fetchTrialConfig().then((c) => {
       setGoogleClientId(c.googleClientId || fromVite || null);
+      if (c.botUsername) setBotUsername(c.botUsername);
     });
   }, []);
 
-  /** Gmail havolasi: ?verify=token yoki server redirect ?verified=challengeId */
+  /** Gmail havolasi: ?verify=token yoki server redirect ?verified=challengeId; Telegram: ?tg= */
   useEffect(() => {
     if (linkHandledRef.current) return;
     const params = new URLSearchParams(window.location.search);
     const token = params.get('verify');
     const verifiedId = params.get('verified');
     const verifyError = params.get('verifyError');
+    const tgChallenge = params.get('tg');
     if (verifyError) {
       linkHandledRef.current = true;
       toast({
@@ -111,6 +114,29 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
         description: 'Havola muddati tugagan yoki yaroqsiz — qayta Google orqali kiring',
         variant: 'destructive',
       });
+      return;
+    }
+    if (tgChallenge) {
+      linkHandledRef.current = true;
+      setChallengeId(tgChallenge);
+      setMethod('telegram');
+      setPending(true);
+      void pollTelegramTrial(tgChallenge)
+        .then((res) => {
+          if (res.verified) {
+            setTargetMasked(res.targetMasked || 'Telegram');
+            if (res.fullName) setFullName(res.fullName);
+            setStep('password');
+            toast({ title: 'Tasdiqlandi', description: 'Telegram — endi parol o‘rnating' });
+          } else {
+            setStep('telegram');
+          }
+        })
+        .catch((err) => {
+          toast({ title: 'Telegram', description: (err as Error).message, variant: 'destructive' });
+          setStep('method');
+        })
+        .finally(() => setPending(false));
       return;
     }
     if (verifiedId) {
@@ -264,27 +290,65 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
       .finally(() => setPending(false));
   };
 
-  const sendPhoneOtp = async () => {
-    const e164 = uzPhoneToE164(phoneLocal);
-    if (e164.length !== 12) {
-      toast({ title: 'Raqam', description: '9 raqamli mobil raqam kiriting', variant: 'destructive' });
-      return;
-    }
-    setMethod('phone');
+  const beginTelegram = async () => {
+    setMethod('telegram');
     setPending(true);
+    pollStopRef.current = false;
     try {
-      const res = await startPhoneTrial(e164);
+      const res = await startTelegramTrial();
       setChallengeId(res.challengeId);
-      setTargetMasked(res.targetMasked);
-      setDevCode(res.devCode || null);
-      setStep('otp');
-      toast({ title: 'Kod yuborildi', description: res.message });
+      setBotUrl(res.botUrl);
+      setBotUsername(res.botUsername || botUsername);
+      setStep('telegram');
+      window.open(res.botUrl, '_blank', 'noopener,noreferrer');
+      toast({ title: 'Telegram', description: res.message });
     } catch (err) {
-      toast({ title: 'Xato', description: (err as Error).message, variant: 'destructive' });
+      toast({ title: 'Telegram', description: (err as Error).message, variant: 'destructive' });
+      setStep('method');
     } finally {
       setPending(false);
     }
   };
+
+  useEffect(() => {
+    if (step !== 'telegram' || !challengeId || method !== 'telegram') return;
+    pollStopRef.current = false;
+    let ticks = 0;
+    const tick = async () => {
+      if (pollStopRef.current) return;
+      ticks += 1;
+      if (ticks > 90) {
+        toast({
+          title: 'Vaqt tugadi',
+          description: 'Telegramda Start bosing yoki qayta urinib ko‘ring',
+          variant: 'destructive',
+        });
+        return;
+      }
+      try {
+        const res = await pollTelegramTrial(challengeId);
+        if (res.verified) {
+          pollStopRef.current = true;
+          setTargetMasked(res.targetMasked || 'Telegram');
+          if (res.fullName) setFullName(res.fullName);
+          setStep('password');
+          toast({ title: 'Tasdiqlandi', description: 'Endi parol o‘rnating' });
+          return;
+        }
+      } catch (err) {
+        pollStopRef.current = true;
+        toast({ title: 'Telegram', description: (err as Error).message, variant: 'destructive' });
+        setStep('method');
+        return;
+      }
+      window.setTimeout(() => void tick(), 2000);
+    };
+    const t = window.setTimeout(() => void tick(), 1500);
+    return () => {
+      pollStopRef.current = true;
+      window.clearTimeout(t);
+    };
+  }, [step, challengeId, method, toast]);
 
   const confirmOtp = async () => {
     if (otp.trim().length < 4) {
@@ -346,77 +410,67 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
             <span>yoki</span>
           </div>
 
-          <div className="trial-phone-card">
-            <div className="trial-phone-card-head">
-              <UzFlag className="trial-uz-flag trial-uz-flag--lg" />
+          <div className="trial-tg-card">
+            <div className="trial-tg-card-head">
+              <TelegramGlyph className="trial-tg-ico trial-tg-ico--lg" />
               <div>
-                <div className="trial-phone-card-title">O‘zbekiston raqami</div>
-                <div className="trial-phone-card-hint">SMS kod bilan tasdiqlanadi</div>
+                <div className="trial-tg-card-title">Telegram orqali</div>
+                <div className="trial-tg-card-hint">Botda Start — akkaunt tasdiqlanadi</div>
               </div>
             </div>
-            <div className="trial-phone-field trial-phone-field--card">
-              <span className="trial-phone-prefix">
-                <UzFlag className="trial-uz-flag" />
-                <span>+998</span>
-              </span>
-              <Input
-                id="trial-phone"
-                inputMode="numeric"
-                autoComplete="tel-national"
-                placeholder="90 123 45 67"
-                value={formatUzPhoneInput(phoneLocal)}
-                onChange={(e) => setPhoneLocal(e.target.value.replace(/\D/g, '').slice(0, 9))}
-                className="border-0 bg-transparent shadow-none focus-visible:ring-0"
-                aria-label="Mobil raqam"
-              />
-            </div>
-            <p className="trial-phone-help">Faqat 9 raqam yozing — masalan: 90 123 45 67</p>
+            <p className="trial-tg-help">
+              {botUsername} ochiladi. Start bosing, keyin saytda parol o‘rnating.
+            </p>
             <Button
               type="button"
               className="login-proopex-submit w-full"
-              disabled={pending || phoneLocal.replace(/\D/g, '').length !== 9}
-              onClick={() => void sendPhoneOtp()}
+              disabled={pending}
+              onClick={() => void beginTelegram()}
             >
-              {pending && method === 'phone' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-              Kod yuborish
+              {pending && method === 'telegram' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              Telegram orqali ro‘yxatdan o‘tish
             </Button>
           </div>
         </div>
       ) : null}
 
-      {step === 'phone' ? (
+      {step === 'telegram' ? (
         <div className="trial-auth-stack">
-          <div className="trial-phone-card">
-            <div className="trial-phone-card-head">
-              <UzFlag className="trial-uz-flag trial-uz-flag--lg" />
+          <div className="trial-tg-card">
+            <div className="trial-tg-card-head">
+              <TelegramGlyph className="trial-tg-ico trial-tg-ico--lg" />
               <div>
-                <div className="trial-phone-card-title">Telefon raqamingiz</div>
-                <div className="trial-phone-card-hint">Tasdiqlash kodi shu raqamga keladi</div>
+                <div className="trial-tg-card-title">Telegramni tasdiqlang</div>
+                <div className="trial-tg-card-hint">Botda Start tugmasini bosing</div>
               </div>
             </div>
-            <div className="trial-phone-field trial-phone-field--card">
-              <span className="trial-phone-prefix">
-                <UzFlag className="trial-uz-flag" />
-                <span>+998</span>
-              </span>
-              <Input
-                id="trial-phone-alone"
-                inputMode="numeric"
-                autoComplete="tel-national"
-                placeholder="90 123 45 67"
-                value={formatUzPhoneInput(phoneLocal)}
-                onChange={(e) => setPhoneLocal(e.target.value.replace(/\D/g, '').slice(0, 9))}
-                className="border-0 bg-transparent shadow-none focus-visible:ring-0"
-              />
+            <div className="flex items-center gap-2 rounded-xl border border-sky-200/80 bg-sky-50/90 px-3 py-2.5 text-sm text-sky-950 dark:border-sky-500/30 dark:bg-sky-950/40 dark:text-sky-100">
+              <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+              <span>Telegram javobini kutmoqdamiz…</span>
             </div>
-            <p className="trial-phone-help">Faqat 9 raqam — operator kodi bilan</p>
+            <p className="trial-tg-help">
+              Agar oyna ochilmasa, quyidagi tugma bilan {botUsername} ga o‘ting.
+            </p>
           </div>
           <div className="flex gap-2">
-            <Button type="button" variant="outline" className="flex-1" onClick={() => setStep('method')}>
+            <Button
+              type="button"
+              variant="outline"
+              className="flex-1"
+              onClick={() => {
+                pollStopRef.current = true;
+                setStep('method');
+              }}
+            >
               Orqaga
             </Button>
-            <Button type="button" className="login-proopex-submit flex-1" disabled={pending} onClick={() => void sendPhoneOtp()}>
-              {pending ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Kod yuborish'}
+            <Button
+              type="button"
+              className="login-proopex-submit flex-1"
+              onClick={() => botUrl && window.open(botUrl, '_blank', 'noopener,noreferrer')}
+              disabled={!botUrl}
+            >
+              Botni ochish
             </Button>
           </div>
         </div>
@@ -427,22 +481,18 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
           <div className="flex items-start gap-2 rounded-xl border border-emerald-200/70 bg-emerald-50/80 px-3 py-2.5 text-sm text-emerald-900 dark:border-emerald-500/30 dark:bg-emerald-950/40 dark:text-emerald-100">
             <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
             <div>
-              <div className="font-semibold">
-                {method === 'google' ? 'Gmailni tasdiqlang' : 'Tasdiqlash kodi'}
-              </div>
+              <div className="font-semibold">Gmailni tasdiqlang</div>
               <div className="text-xs opacity-90">
-                {method === 'google'
-                  ? emailSent
-                    ? `${targetMasked} ga kod va havola yuborildi — kodni kiriting yoki Gmaildagi havolani bosing`
-                    : `${targetMasked} — kodni kiriting yoki havolani oching`
-                  : `${targetMasked} ga yuborildi`}
+                {emailSent
+                  ? `${targetMasked} ga kod va havola yuborildi — kodni kiriting yoki Gmaildagi havolani bosing`
+                  : `${targetMasked} — kodni kiriting yoki havolani oching`}
               </div>
               {devCode ? (
                 <div className="mt-1 rounded-md bg-white/70 px-2 py-1 font-mono text-xs dark:bg-black/30">
                   Kod: <strong>{devCode}</strong>
                 </div>
               ) : null}
-              {method === 'google' && verifyLink ? (
+              {verifyLink ? (
                 <a
                   href={verifyLink}
                   className="mt-2 inline-block text-xs font-semibold underline underline-offset-2"
@@ -476,7 +526,7 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
                 setOtp('');
                 setVerifyLink(null);
                 setDevCode(null);
-                setStep(method === 'phone' ? 'phone' : 'method');
+                setStep('method');
               }}
             >
               Orqaga
@@ -491,9 +541,9 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
       {step === 'password' ? (
         <div className="space-y-3">
           <div className="rounded-xl border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-            {method === 'phone' ? (
+            {method === 'telegram' ? (
               <span className="inline-flex items-center gap-1.5">
-                <Phone className="h-3.5 w-3.5" /> {targetMasked}
+                <TelegramGlyph className="h-3.5 w-3.5" /> {targetMasked}
               </span>
             ) : (
               <span className="inline-flex items-center gap-1.5">
@@ -574,37 +624,32 @@ export function TrialLoginFields({
         <button
           type="button"
           role="tab"
-          aria-selected={method === 'phone'}
-          className={cn('trial-login-tab', method === 'phone' && 'trial-login-tab--on')}
-          onClick={() => onMethodChange('phone')}
+          aria-selected={method === 'telegram'}
+          className={cn('trial-login-tab', method === 'telegram' && 'trial-login-tab--on')}
+          onClick={() => onMethodChange('telegram')}
         >
-          <UzFlag className="trial-uz-flag" />
-          Telefon
+          <TelegramGlyph className="h-3.5 w-3.5" />
+          Telegram
         </button>
       </div>
 
-      {method === 'phone' ? (
-        <div className="trial-phone-card trial-phone-card--compact">
-          <div className="trial-phone-card-head">
-            <UzFlag className="trial-uz-flag trial-uz-flag--lg" />
+      {method === 'telegram' ? (
+        <div className="trial-tg-card trial-tg-card--compact">
+          <div className="trial-tg-card-head">
+            <TelegramGlyph className="trial-tg-ico trial-tg-ico--lg" />
             <div>
-              <div className="trial-phone-card-title">Telefon raqam</div>
-              <div className="trial-phone-card-hint">O‘zbekiston mobil raqami</div>
+              <div className="trial-tg-card-title">Telegram login</div>
+              <div className="trial-tg-card-hint">@username yoki tg_…</div>
             </div>
           </div>
-          <div className="trial-phone-field trial-phone-field--card">
-            <span className="trial-phone-prefix">
-              <UzFlag className="trial-uz-flag" />
-              <span>+998</span>
-            </span>
+          <div className="space-y-2">
+            <Label htmlFor="login-tg">Login</Label>
             <Input
-              id="login-phone"
-              inputMode="numeric"
-              autoComplete="tel-national"
-              placeholder="90 123 45 67"
-              value={formatUzPhoneInput(login)}
-              onChange={(e) => onLoginChange(e.target.value.replace(/\D/g, '').slice(0, 9))}
-              className="border-0 bg-transparent shadow-none focus-visible:ring-0"
+              id="login-tg"
+              autoComplete="username"
+              placeholder="@username"
+              value={login}
+              onChange={(e) => onLoginChange(e.target.value)}
             />
           </div>
         </div>
@@ -629,31 +674,14 @@ export function TrialLoginFields({
   );
 }
 
-function UzFlag({ className }: { className?: string }) {
+function TelegramGlyph({ className }: { className?: string }) {
   return (
-    <svg
-      className={className}
-      viewBox="0 0 36 24"
-      width="22"
-      height="15"
-      aria-hidden
-      focusable="false"
-    >
-      <rect width="36" height="8" y="0" fill="#0099B5" />
-      <rect width="36" height="8" y="8" fill="#FFFFFF" />
-      <rect width="36" height="8" y="16" fill="#1EB53A" />
-      <rect width="36" height="1.2" y="7.4" fill="#CE1126" />
-      <rect width="36" height="1.2" y="15.4" fill="#CE1126" />
-      <circle cx="7.2" cy="4" r="2.15" fill="#FFFFFF" />
-      <circle cx="8" cy="3.55" r="1.85" fill="#0099B5" />
-      <g fill="#FFFFFF">
-        <circle cx="12.2" cy="2.2" r="0.45" />
-        <circle cx="14.1" cy="2.9" r="0.45" />
-        <circle cx="15.9" cy="3.7" r="0.45" />
-        <circle cx="12.6" cy="4.1" r="0.45" />
-        <circle cx="14.5" cy="4.8" r="0.45" />
-        <circle cx="13.2" cy="5.7" r="0.45" />
-      </g>
+    <svg className={className || 'h-5 w-5'} viewBox="0 0 24 24" aria-hidden focusable="false">
+      <circle cx="12" cy="12" r="12" fill="#229ED9" />
+      <path
+        fill="#fff"
+        d="M17.6 7.2 15.9 16c-.1.5-.4.6-.9.4l-2.5-1.9-1.2 1.2c-.1.1-.3.3-.5.3l.2-2.6 4.7-4.3c.2-.2 0-.3-.3-.1l-5.8 3.7-2.5-.8c-.5-.1-.5-.5.1-.8l9.8-3.8c.4-.2.8.1.6.7z"
+      />
     </svg>
   );
 }
