@@ -1,0 +1,1188 @@
+import { useMemo, useState, type ReactNode } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  CalendarX2,
+  CheckCircle2,
+  Clock3,
+  Eye,
+  ClipboardList,
+  FileDown,
+  FileSignature,
+  FileSpreadsheet,
+  Heading,
+  Loader2,
+  MapPin,
+  Phone,
+  ScanLine,
+  Search,
+  Send,
+  ShieldCheck,
+  Trash2,
+  UserRound,
+  X,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { cn } from "@/lib/utils";
+import { useToast } from "@/hooks/use-toast";
+import { useAuth } from "@/contexts/AuthContext";
+import { ExplanationLetterDialog, StatusChip, TestChip } from "@/components/explanation-letter/ExplanationLetterDialog";
+import { ReviewChip, StageBadge } from "@/components/explanation-letter/LetterReviewPanel";
+import { StageLadder } from "@/components/explanation-letter/StageLadder";
+import { LetterHeaderDialog } from "@/components/explanation-letter/LetterHeaderDialog";
+import { LetterLookupBar } from "@/components/explanation-letter/LetterLookup";
+import { StaffGroupTabs, staffGroupOf, type StaffGroup } from "@/components/explanation-letter/StaffGroupTabs";
+import {
+  FINAL_STRIKE,
+  LETTER_STAGES,
+  canDeleteLetters,
+  canManageLetters,
+  downloadLetterPdf,
+  downloadLettersBulk,
+  downloadLettersReportExcel,
+  fmtLetterDate,
+  fmtLetterStamp,
+  fmtSum,
+  useDeleteLetters,
+  useLetterReportSchedule,
+  useMonthLetters,
+  useReviewLetter,
+  useSendLetterReport,
+  type ExplanationLetter,
+} from "@/lib/explanation-letters-api";
+import { downloadStageRosterPdf, stageReportRows } from "@/lib/explanation-stage-report-pdf";
+import {
+  clearAllScannerDocs,
+  deleteScannerDoc,
+  fetchScannerDocsInbox,
+  formatExpiresIn,
+  scannerDocDownloadUrl,
+  type ScannerDoc,
+} from "@/lib/scanner-docs-api";
+
+type StatusTab = "all" | "waiting" | "decide" | "approved" | "cancelled";
+type KindTab = "all" | "late" | "absent";
+
+const MONTHS_UZ = ["Yanvar", "Fevral", "Mart", "Aprel", "May", "Iyun", "Iyul", "Avgust", "Sentabr", "Oktabr", "Noyabr", "Dekabr"];
+const BULK_MAX = 300;
+const PAGE = 100;
+
+function thisMonth() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tashkent", year: "numeric", month: "2-digit" }).format(new Date()).slice(0, 7);
+}
+
+function monthLabel(m: string) {
+  if (m === "all") return "Barcha oylar";
+  const [y, mm] = m.split("-").map(Number);
+  return y && mm ? `${MONTHS_UZ[mm - 1]} ${y}` : m;
+}
+
+function penaltyLabel(n: number) {
+  return LETTER_STAGES[Math.min(n, FINAL_STRIKE) - 1]?.label ?? "";
+}
+
+const stageOf = (l: ExplanationLetter) => Math.min(l.strikeN, FINAL_STRIKE);
+
+const NO_COORD = "Koordinatorsiz";
+const NO_BRANCH = "Filialsiz";
+const coordOf = (l: ExplanationLetter) => l.coordinator?.name?.trim() || NO_COORD;
+const branchOf = (l: ExplanationLetter) => l.branch.trim() || l.contacts?.branchName?.trim() || NO_BRANCH;
+
+function countOptions(values: string[]): [string, number][] {
+  const m = new Map<string, number>();
+  for (const v of values) m.set(v, (m.get(v) ?? 0) + 1);
+  return [...m].sort((a, b) => a[0].localeCompare(b[0], "uz"));
+}
+
+function eventDetail(l: ExplanationLetter) {
+  if (l.kind === "absent") return l.planStart && l.planEnd ? `Ish vaqti ${l.planStart}–${l.planEnd}` : "Ishga kelmagan";
+  const parts = [l.planStart ? `Reja ${l.planStart}` : null, l.checkIn ? `keldi ${l.checkIn}` : null].filter(Boolean);
+  return `${parts.join(" · ")}${l.lateMinutes ? ` · ${l.lateMinutes} daq.` : ""}` || "Kechikkan";
+}
+
+export default function TushuntirishXatlariPage() {
+  const { user } = useAuth();
+  const { toast } = useToast();
+  const allowed = canManageLetters(user?.role);
+  const [month, setMonth] = useState(thisMonth);
+  const [status, setStatus] = useState<StatusTab>("all");
+  const [kind, setKind] = useState<KindTab>("all");
+  const [query, setQuery] = useState("");
+  const [stage, setStage] = useState<number | null>(null);
+  const [openId, setOpenId] = useState<number | null>(null);
+  const [busyId, setBusyId] = useState<number | null>(null);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [reportBusy, setReportBusy] = useState(false);
+  const [headerOpen, setHeaderOpen] = useState(false);
+  const canDelete = canDeleteLetters(user?.role);
+  const [selected, setSelected] = useState<Set<number>>(() => new Set());
+  const [confirmIds, setConfirmIds] = useState<number[] | null>(null);
+  const q = useMonthLetters(month, allowed);
+  const review = useReviewLetter();
+  const del = useDeleteLetters();
+
+  const [group, setGroupRaw] = useState<StaffGroup>("pharmacy");
+  const [branch, setBranch] = useState("");
+  const [coord, setCoord] = useState("");
+  const setGroup = (g: StaffGroup) => {
+    setGroupRaw(g);
+    setBranch("");
+    setCoord("");
+  };
+  const allItems = q.data?.items ?? [];
+  const groupCounts = useMemo(() => {
+    const out: Record<StaffGroup, number> = { pharmacy: 0, office: 0 };
+    for (const l of allItems) out[staffGroupOf(l)] += 1;
+    return out;
+  }, [allItems]);
+  const groupItems = useMemo(() => allItems.filter((l) => staffGroupOf(l) === group), [allItems, group]);
+  const coordOptions = useMemo(() => countOptions(groupItems.map(coordOf)), [groupItems]);
+  const branchOptions = useMemo(
+    () => countOptions(groupItems.filter((l) => !coord || coordOf(l) === coord).map(branchOf)),
+    [groupItems, coord],
+  );
+  const items = useMemo(
+    () => groupItems.filter((l) => (!coord || coordOf(l) === coord) && (!branch || branchOf(l) === branch)),
+    [groupItems, coord, branch],
+  );
+  const office = group === "office";
+  const months = useMemo(() => {
+    const set = new Set([thisMonth(), ...(q.data?.months ?? [])]);
+    if (month !== "all") set.add(month);
+    return [...set].sort().reverse();
+  }, [q.data?.months, month]);
+
+  const stats = useMemo(
+    () => ({
+      all: items.length,
+      signed: items.filter((l) => l.status === "signed").length,
+      waiting: items.filter((l) => l.status !== "signed" && l.reviewStatus !== "cancelled").length,
+      decide: items.filter((l) => l.status === "signed" && !l.reviewStatus).length,
+      approved: items.filter((l) => l.reviewStatus === "approved").length,
+      cancelled: items.filter((l) => l.reviewStatus === "cancelled").length,
+      late: items.filter((l) => l.kind === "late").length,
+      absent: items.filter((l) => l.kind === "absent").length,
+    }),
+    [items],
+  );
+
+  const stageCounts = useMemo(() => {
+    const out: Record<number, number> = {};
+    for (const l of items) out[stageOf(l)] = (out[stageOf(l)] ?? 0) + 1;
+    return out;
+  }, [items]);
+
+  const list = useMemo(() => {
+    const s = query.trim().toLocaleLowerCase("uz");
+    return items.filter((l) => {
+      if (status === "waiting" && (l.status === "signed" || l.reviewStatus === "cancelled")) return false;
+      if (status === "decide" && (l.status !== "signed" || l.reviewStatus)) return false;
+      if (status === "approved" && l.reviewStatus !== "approved") return false;
+      if (status === "cancelled" && l.reviewStatus !== "cancelled") return false;
+      if (kind !== "all" && l.kind !== kind) return false;
+      if (stage != null && stageOf(l) !== stage) return false;
+      if (!s) return true;
+      return `${l.fullName} ${l.branch} ${l.position} ${l.letterNo} ${l.phone ?? ""} ${l.reasonText ?? ""}`
+        .toLocaleLowerCase("uz")
+        .includes(s);
+    });
+  }, [items, status, kind, stage, query]);
+
+  const [limit, setLimit] = useState(PAGE);
+  const filterKey = `${month}|${group}|${coord}|${branch}|${status}|${kind}|${stage}|${query}`;
+  const [limitKey, setLimitKey] = useState(filterKey);
+  if (limitKey !== filterKey) {
+    setLimitKey(filterKey);
+    setLimit(PAGE);
+    setSelected(new Set());
+  }
+  const shown = useMemo(() => list.slice(0, limit), [list, limit]);
+  const allChecked = list.length > 0 && list.every((l) => selected.has(l.id));
+
+  const toggle = (id: number) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const toggleAll = () => setSelected(allChecked ? new Set() : new Set(list.map((l) => l.id)));
+
+  const confirmLetters = useMemo(() => {
+    if (!confirmIds) return [];
+    const ids = new Set(confirmIds);
+    return allItems.filter((l) => ids.has(l.id));
+  }, [confirmIds, allItems]);
+
+  const runDelete = () => {
+    if (!confirmIds?.length) return;
+    const ids = confirmIds;
+    del.mutate(ids, {
+      onSuccess: (r) => {
+        toast({
+          title: "O‘chirildi — holat yo‘qolidi",
+          description: `${r.deleted} ta xat o‘chirildi. Shu holatlar bo‘lmagandek: jarima/bosqichdan chiqdi, qolgan xatlar qayta tartiblandi. Keyingi kechikish 1-holatdan boshlanadi.`,
+        });
+        setSelected((prev) => {
+          const next = new Set(prev);
+          for (const id of ids) next.delete(id);
+          return next;
+        });
+        if (openId != null && ids.includes(openId)) setOpenId(null);
+        setConfirmIds(null);
+      },
+      onError: (e) => toast({ title: "O‘chirilmadi", description: (e as Error).message, variant: "destructive" }),
+    });
+  };
+
+  const approve = (l: ExplanationLetter) =>
+    review.mutate(
+      { id: l.id, action: "approve", note: "" },
+      {
+        onSuccess: () => toast({ title: "Tasdiqlandi", description: `${l.fullName} — jarima kuchida qoladi.` }),
+        onError: (e) => toast({ title: "Qaror saqlanmadi", description: (e as Error).message, variant: "destructive" }),
+      },
+    );
+
+  const pdf = async (l: ExplanationLetter) => {
+    setBusyId(l.id);
+    try {
+      await downloadLetterPdf(l);
+    } catch (e) {
+      toast({ title: "PDF", description: (e as Error).message, variant: "destructive" });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const bulk = async () => {
+    if (!list.length) return;
+    setBulkBusy(true);
+    try {
+      await downloadLettersBulk({ month, status: "all", ids: list.slice(0, BULK_MAX).map((l) => l.id) });
+      if (list.length > BULK_MAX) toast({ title: "Birinchi 300 ta xat yuklandi", description: "Qolganlari uchun filtrni toraytiring." });
+    } catch (e) {
+      toast({ title: "PDF", description: (e as Error).message, variant: "destructive" });
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  /** Tanlangan bosqich: to‘liq hisobot (muammo, chora, jarima, sabab, koordinator…) */
+  const stageReport = async () => {
+    if (stage == null) {
+      toast({
+        title: "Bosqich tanlang",
+        description: "Avval yuqoridan 1–6 holatni tanlang — shu bosqich to‘liq hisoboti chiqadi.",
+        variant: "destructive",
+      });
+      return;
+    }
+    const rows = stageReportRows(list, stage, NO_COORD);
+    if (!rows.length) {
+      toast({ title: "Bo‘sh", description: "Bu bosqichda hisobot uchun yozuv yo‘q.", variant: "destructive" });
+      return;
+    }
+    setReportBusy(true);
+    try {
+      const filterBits = [
+        coord || null,
+        branch || null,
+        status !== "all" ? status : null,
+        kind !== "all" ? (kind === "late" ? "Kechikish" : "Kelmagan") : null,
+      ].filter(Boolean);
+      await downloadStageRosterPdf({
+        stage,
+        monthLabel: monthLabel(month),
+        groupLabel: group === "pharmacy" ? "Dorixona" : "Ofis",
+        rows,
+        filterNote: filterBits.length ? filterBits.join(" · ") : undefined,
+      });
+      toast({ title: "Hisobot tayyor", description: `${stage}-holat · ${rows.length} ta yozuv (to‘liq)` });
+    } catch (e) {
+      toast({ title: "Hisobot", description: (e as Error).message, variant: "destructive" });
+    } finally {
+      setReportBusy(false);
+    }
+  };
+
+  if (!allowed) {
+    return <div className="p-6 text-sm text-muted-foreground">Faqat admin va HR uchun.</div>;
+  }
+
+  return (
+    <div className="mx-auto max-w-7xl space-y-4 px-3 py-4 sm:px-5 sm:py-6">
+      <header className="flex flex-wrap items-center gap-3">
+        <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-[#0b3a5c] text-white shadow-sm shadow-sky-900/30">
+          <FileSignature className="h-5 w-5" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h1 className="text-lg font-extrabold tracking-tight text-slate-900 sm:text-xl dark:text-white">Tushuntirish xatlari</h1>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Har bir kechikish va kelmaslik bo‘yicha xodim xati — sabab, imzo, QR va PDF bir joyda
+          </p>
+        </div>
+        <div className="flex w-full gap-2 sm:w-auto">
+          <Button type="button" variant="outline" className="h-10 shrink-0 gap-1.5 rounded-xl" onClick={() => setHeaderOpen(true)}>
+            <Heading className="h-4 w-4" />
+            <span className="hidden sm:inline">Xat shapkasi</span>
+          </Button>
+          <select
+            value={month}
+            onChange={(e) => setMonth(e.target.value)}
+            className="h-10 min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-800 outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100 sm:flex-none dark:border-white/10 dark:bg-slate-900 dark:text-white"
+          >
+            {months.map((m) => (
+              <option key={m} value={m}>
+                {monthLabel(m)}
+              </option>
+            ))}
+            <option value="all">Barcha oylar</option>
+          </select>
+          <Button
+            type="button"
+            variant="outline"
+            className="h-10 shrink-0 gap-1.5 rounded-xl border-[#0b3a5c]/30 font-semibold text-[#0b3a5c] hover:bg-[#0b3a5c]/5"
+            disabled={reportBusy || stage == null || !list.length}
+            title={stage == null ? "Avval 1–6 holatni tanlang" : `${stage}-holat: ism + koordinator`}
+            onClick={() => void stageReport()}
+          >
+            {reportBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ClipboardList className="h-4 w-4" />}
+            <span className="hidden sm:inline">Hisobot</span>
+            {stage != null ? (
+              <span className="rounded-full bg-[#0b3a5c]/10 px-1.5 text-[11px] tabular-nums">{stage}</span>
+            ) : null}
+          </Button>
+          <Button
+            type="button"
+            className="h-10 shrink-0 gap-1.5 rounded-xl bg-[#0b3a5c] text-white hover:bg-[#0b3a5c]/90"
+            disabled={!list.length || bulkBusy}
+            onClick={() => void bulk()}
+          >
+            {bulkBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileDown className="h-4 w-4" />}
+            <span className="hidden sm:inline">Ro‘yxatni PDF</span>
+            <span className="sm:hidden">PDF</span>
+            <span className="rounded-full bg-white/20 px-1.5 text-[11px] tabular-nums">{Math.min(list.length, BULK_MAX)}</span>
+          </Button>
+        </div>
+      </header>
+
+      <ScannerInboxPanel enabled={allowed} />
+
+      <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
+        <StaffGroupTabs value={group} onChange={setGroup} counts={q.isLoading ? undefined : groupCounts} className="lg:max-w-xl lg:flex-1" />
+        <div className="flex flex-col gap-2 sm:flex-row lg:ml-auto">
+          {!office ? (
+            <FilterSelect
+              icon={<UserRound className="h-4 w-4" />}
+              label="Koordinator"
+              allLabel="Barcha koordinatorlar"
+              value={coord}
+              onChange={(v) => {
+                setCoord(v);
+                setBranch("");
+              }}
+              options={coordOptions}
+            />
+          ) : null}
+          <FilterSelect
+            icon={<MapPin className="h-4 w-4" />}
+            label={office ? "Bo‘lim" : "Filial"}
+            allLabel={office ? "Barcha bo‘limlar" : "Barcha filiallar"}
+            value={branch}
+            onChange={setBranch}
+            options={branchOptions}
+          />
+          {coord || branch ? (
+            <Button
+              type="button"
+              variant="ghost"
+              className="h-10 shrink-0 gap-1 rounded-xl text-slate-600"
+              onClick={() => {
+                setCoord("");
+                setBranch("");
+              }}
+            >
+              <X className="h-4 w-4" /> Tozalash
+            </Button>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+        <Stat label="Jami" value={stats.all} loading={q.isLoading} tone="bg-slate-50 text-slate-800 ring-slate-200 dark:bg-white/5 dark:text-white dark:ring-white/10" />
+        <Stat label="Imzo kutilmoqda" value={stats.waiting} loading={q.isLoading} tone="bg-amber-50 text-amber-700 ring-amber-200 dark:bg-amber-500/10 dark:text-amber-200 dark:ring-amber-500/30" />
+        <Stat label="Qaror kutilmoqda" value={stats.decide} loading={q.isLoading} tone="bg-sky-50 text-sky-700 ring-sky-200 dark:bg-sky-500/10 dark:text-sky-200 dark:ring-sky-500/30" />
+        <Stat label="Tasdiqlangan" value={stats.approved} loading={q.isLoading} tone="bg-emerald-50 text-emerald-700 ring-emerald-200 dark:bg-emerald-500/10 dark:text-emerald-200 dark:ring-emerald-500/30" />
+        <Stat
+          label="Bekor qilingan"
+          value={stats.cancelled}
+          loading={q.isLoading}
+          tone="col-span-2 bg-slate-100 text-slate-700 ring-slate-300 sm:col-span-1 dark:bg-white/5 dark:text-slate-200 dark:ring-white/15"
+        />
+      </div>
+
+      <ReportPanel />
+
+      <LetterLookupBar onOpenLetter={setOpenId} />
+
+      <section className="space-y-2 rounded-2xl border border-slate-200 bg-white p-3 dark:border-white/10 dark:bg-slate-900">
+        <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5">
+          <p className="text-sm font-bold text-slate-900 dark:text-white">Bosqichlar bo‘yicha</p>
+          <p className="text-[11px] text-slate-500">
+            {stage ? (
+              <>
+                <button type="button" className="font-semibold text-sky-700 hover:underline" onClick={() => setStage(null)}>
+                  Filtrni olib tashlash
+                </button>
+                <span className="text-slate-400"> · </span>
+                <span>
+                  «Hisobot» — {stage}-holat: muammo, chora, jarima, sabab, koordinator (to‘liq PDF)
+                </span>
+              </>
+            ) : (
+              "Bosqichni tanlang, keyin «Hisobot» — rahbarlar uchun to‘liq PDF"
+            )}
+          </p>
+        </div>
+        <StageLadder counts={stageCounts} value={stage} onChange={setStage} />
+        <p className="text-[11px] leading-snug text-slate-500">
+          <b className="text-slate-700 dark:text-slate-200">Tasdiqlash</b> — jarima oylikda qoladi, keyingi holat keyingi bosqichga
+          o‘tadi.{" "}
+          <b className="text-slate-700 dark:text-slate-200">Bekor qilish</b> — holat uzrli, hisobdan chiqadi va bosqich oshmaydi:
+          keyingi holat shu bosqichdan (masalan, 1-bosqichdan) boshlanadi. Qaror xatni ochib, o‘ng paneldagi «Rahbariyat qarori»
+          bo‘limida qabul qilinadi.
+        </p>
+      </section>
+
+      <div className="flex flex-col gap-2 rounded-2xl border border-slate-200 bg-white p-2 sm:flex-row sm:flex-wrap sm:items-center dark:border-white/10 dark:bg-slate-900">
+        <div className="-mx-0.5 max-w-full overflow-x-auto px-0.5 [scrollbar-width:none]">
+          <Segmented<StatusTab>
+            value={status}
+            onChange={setStatus}
+            options={[
+              ["all", "Barchasi", stats.all],
+              ["waiting", "Imzo kutilmoqda", stats.waiting],
+              ["decide", "Qaror kutilmoqda", stats.decide],
+              ["approved", "Tasdiqlangan", stats.approved],
+              ["cancelled", "Bekor", stats.cancelled],
+            ] as const}
+          />
+        </div>
+        <Segmented<KindTab>
+          value={kind}
+          onChange={setKind}
+          options={[
+            ["all", "Hammasi", null],
+            ["late", "Kechikish", stats.late],
+            ["absent", "Kelmagan", stats.absent],
+          ] as const}
+        />
+        <label className="relative min-w-0 flex-1 sm:ml-auto sm:max-w-xs">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Ism, filial, telefon yoki №…"
+            className="h-10 w-full rounded-xl border border-slate-200 bg-white pl-9 pr-3 text-sm outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100 dark:border-white/10 dark:bg-slate-950 dark:text-white dark:focus:ring-sky-500/20"
+          />
+        </label>
+      </div>
+
+      {q.isError ? (
+        <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-700">{(q.error as Error).message}</p>
+      ) : q.isLoading ? (
+        <p className="flex items-center justify-center gap-2 py-10 text-sm text-slate-500">
+          <Loader2 className="h-4 w-4 animate-spin" /> Yuklanmoqda…
+        </p>
+      ) : !list.length ? (
+        <div className="flex flex-col items-center gap-2 rounded-2xl border border-dashed border-slate-200 py-12 text-center text-sm text-slate-500 dark:border-white/10">
+          <ShieldCheck className="h-8 w-8 text-emerald-500" />
+          {items.length || coord || branch
+            ? "Filtr bo‘yicha xat topilmadi."
+            : `${monthLabel(month)} — ${office ? "ofis" : "dorixona"} xodimlarida tushuntirish xati talab qilingan holat yo‘q.`}
+        </div>
+      ) : (
+        <>
+          {canDelete ? (
+            <div
+              className={cn(
+                "sticky top-2 z-10 flex flex-wrap items-center gap-2 rounded-2xl border px-3 py-2 text-sm transition",
+                selected.size
+                  ? "border-red-200 bg-red-50 shadow-sm dark:border-red-500/30 dark:bg-red-950/60"
+                  : "border-slate-200 bg-white dark:border-white/10 dark:bg-slate-900",
+              )}
+            >
+              <label className="inline-flex cursor-pointer items-center gap-2 font-semibold text-slate-700 dark:text-slate-200">
+                <input type="checkbox" className="h-4 w-4 accent-red-600" checked={allChecked} onChange={toggleAll} />
+                Filtrdagi hammasini belgilash ({list.length})
+              </label>
+              {selected.size ? (
+                <>
+                  <span className="text-xs text-red-700 dark:text-red-200">
+                    Belgilangan: <b className="tabular-nums">{selected.size}</b>
+                  </span>
+                  <div className="ml-auto flex gap-2">
+                    <Button type="button" variant="ghost" size="sm" className="h-9 gap-1 rounded-xl" onClick={() => setSelected(new Set())}>
+                      <X className="h-4 w-4" /> Bekor
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="h-9 gap-1.5 rounded-xl bg-red-600 text-white hover:bg-red-700"
+                      onClick={() => setConfirmIds([...selected])}
+                    >
+                      <Trash2 className="h-4 w-4" /> O‘chirish ({selected.size})
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <span className="text-[11px] text-slate-500">Xatlarni belgilab, birdaniga o‘chirishingiz mumkin</span>
+              )}
+            </div>
+          ) : null}
+
+          <div className="hidden overflow-hidden rounded-2xl border border-slate-200 bg-white md:block dark:border-white/10 dark:bg-slate-900">
+            <table className="w-full table-fixed text-left text-[13px]">
+              <thead className="bg-slate-50 text-[11px] font-bold uppercase tracking-wide text-slate-500 dark:bg-white/5 dark:text-slate-400">
+                <tr>
+                  {canDelete ? (
+                    <th className="w-10 px-3 py-2.5">
+                      <input type="checkbox" className="h-4 w-4 accent-red-600" checked={allChecked} onChange={toggleAll} title="Hammasini belgilash" />
+                    </th>
+                  ) : null}
+                  <th className="w-[19%] px-3 py-2.5">Xodim</th>
+                  <th className="w-[12%] px-3 py-2.5">{office ? "Bo‘lim" : "Filial"}</th>
+                  <th className="w-[14%] px-3 py-2.5">Muammo</th>
+                  <th className="w-[13%] px-3 py-2.5">Bosqich · chora</th>
+                  <th className="px-3 py-2.5">Sabab (xodim yozgan)</th>
+                  <th className="w-[15%] px-3 py-2.5">Holati · qaror</th>
+                  <th className={cn("px-3 py-2.5 text-right", canDelete ? "w-[150px]" : "w-[120px]")}>Amallar</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-white/5">
+                {shown.map((l) => (
+                  <tr
+                    key={l.id}
+                    onClick={() => setOpenId(l.id)}
+                    className={cn(
+                      "cursor-pointer align-top transition hover:bg-sky-50/50 dark:hover:bg-white/5",
+                      selected.has(l.id) && "bg-red-50/70 hover:bg-red-50 dark:bg-red-500/10",
+                    )}
+                  >
+                    {canDelete ? (
+                      <td className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
+                        <input type="checkbox" className="h-4 w-4 accent-red-600" checked={selected.has(l.id)} onChange={() => toggle(l.id)} />
+                      </td>
+                    ) : null}
+                    <td className="px-3 py-2.5">
+                      <p className="flex items-center gap-1.5 font-semibold text-slate-900 dark:text-white">
+                        <span className="truncate">{l.fullName}</span>
+                        {l.isTest ? <TestChip /> : null}
+                      </p>
+                      <p className="truncate text-[11px] text-slate-500">{l.position || "—"}</p>
+                      {l.phone ? <p className="text-[11px] tabular-nums text-slate-400">{l.phone}</p> : null}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <p className="line-clamp-2 text-slate-700 dark:text-slate-200">{l.branch || "—"}</p>
+                      <p className="truncate text-[11px] text-slate-400">{l.shift}</p>
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <KindBadge l={l} />
+                      <p className="mt-1 text-[11px] text-slate-500">{fmtLetterDate(l.eventDate)}</p>
+                      <p className="text-[11px] text-slate-400">{eventDetail(l)}</p>
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <StageBadge n={l.strikeN} />
+                      <p className="mt-1 text-[11px] text-slate-500">{penaltyLabel(l.strikeN)}</p>
+                      {l.amount > 0 ? <p className="text-[11px] font-semibold tabular-nums text-slate-700 dark:text-slate-200">{fmtSum(l.amount)}</p> : null}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      {l.reasonText ? (
+                        <p className="line-clamp-3 text-[12px] text-slate-600 dark:text-slate-300">{l.reasonText}</p>
+                      ) : (
+                        <p className="text-[12px] italic text-slate-400">Hali yozilmagan</p>
+                      )}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <div className="flex flex-wrap gap-1">
+                        <StatusChip status={l.status} />
+                        <ReviewChip status={l.reviewStatus} />
+                      </div>
+                      {l.signedAt ? <p className="mt-1 text-[11px] tabular-nums text-slate-500">{fmtLetterStamp(l.signedAt)}</p> : null}
+                      {l.reviewedByName ? <p className="truncate text-[10px] text-slate-500">Qaror: {l.reviewedByName}</p> : null}
+                      <p className="text-[10px] text-slate-400">№ {l.letterNo}</p>
+                    </td>
+                    <td className="px-3 py-2.5 text-right">
+                      <div className="inline-flex flex-wrap justify-end gap-1">
+                        {l.status === "signed" && !l.reviewStatus ? (
+                          <IconBtn title="Tasdiqlash (jarima qoladi)" disabled={review.isPending} onClick={() => approve(l)} tone="success">
+                            <CheckCircle2 className="h-4 w-4" />
+                          </IconBtn>
+                        ) : null}
+                        <IconBtn title="Ko‘rish" onClick={() => setOpenId(l.id)}>
+                          <Eye className="h-4 w-4" />
+                        </IconBtn>
+                        <IconBtn title="PDF yuklab olish" disabled={busyId === l.id} onClick={() => void pdf(l)}>
+                          {busyId === l.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileDown className="h-4 w-4" />}
+                        </IconBtn>
+                        {canDelete ? (
+                          <IconBtn title="O‘chirish" tone="danger" onClick={() => setConfirmIds([l.id])}>
+                            <Trash2 className="h-4 w-4" />
+                          </IconBtn>
+                        ) : null}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <ul className="space-y-2 md:hidden">
+            {shown.map((l) => (
+              <li
+                key={l.id}
+                onClick={() => setOpenId(l.id)}
+                className={cn(
+                  "rounded-2xl border bg-white p-3 shadow-sm active:scale-[0.99] dark:bg-slate-900",
+                  l.status === "signed" ? "border-slate-200 dark:border-white/10" : "border-amber-200 dark:border-amber-500/30",
+                  selected.has(l.id) && "border-red-300 bg-red-50/70 dark:border-red-500/40 dark:bg-red-500/10",
+                )}
+              >
+                <div className="flex items-start gap-2">
+                  {canDelete ? (
+                    <input
+                      type="checkbox"
+                      className="mt-1 h-5 w-5 shrink-0 accent-red-600"
+                      checked={selected.has(l.id)}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={() => toggle(l.id)}
+                    />
+                  ) : null}
+                  <div className="min-w-0 flex-1">
+                    <p className="flex flex-wrap items-center gap-1.5 text-sm font-bold text-slate-900 dark:text-white">
+                      {l.fullName}
+                      {l.isTest ? <TestChip /> : null}
+                    </p>
+                    <p className="text-[11px] text-slate-500">{l.position || "—"}</p>
+                  </div>
+                  <div className="flex flex-col items-end gap-1">
+                    <StatusChip status={l.status} />
+                    <ReviewChip status={l.reviewStatus} />
+                  </div>
+                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-600 dark:text-slate-300">
+                  <KindBadge l={l} />
+                  <span className="font-semibold">{fmtLetterDate(l.eventDate)}</span>
+                  <span>{eventDetail(l)}</span>
+                </div>
+                <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500">
+                  {l.branch ? (
+                    <span className="inline-flex items-center gap-1">
+                      <MapPin className="h-3 w-3" /> {l.branch}
+                    </span>
+                  ) : null}
+                  {l.phone ? (
+                    <span className="inline-flex items-center gap-1 tabular-nums">
+                      <Phone className="h-3 w-3" /> {l.phone}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px]">
+                  <StageBadge n={l.strikeN} />
+                  <span className="font-semibold text-slate-700 dark:text-slate-200">{penaltyLabel(l.strikeN)}</span>
+                  {l.amount > 0 ? <span className="tabular-nums text-slate-500">· {fmtSum(l.amount)}</span> : null}
+                </div>
+                <div className="mt-2 rounded-xl bg-slate-50 px-2.5 py-2 text-[12px] dark:bg-white/5">
+                  {l.reasonText ? (
+                    <p className="line-clamp-3 text-slate-600 dark:text-slate-300">{l.reasonText}</p>
+                  ) : (
+                    <p className="italic text-slate-400">Sabab hali yozilmagan</p>
+                  )}
+                </div>
+                <div className="mt-2 flex items-center gap-2">
+                  <p className="min-w-0 flex-1 truncate text-[10px] text-slate-400">
+                    № {l.letterNo}
+                    {l.signedAt ? ` · imzo ${fmtLetterStamp(l.signedAt)}` : ""}
+                  </p>
+                  {l.status === "signed" && !l.reviewStatus ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="h-9 gap-1 rounded-xl bg-emerald-600 px-3 text-white hover:bg-emerald-700"
+                      disabled={review.isPending}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        approve(l);
+                      }}
+                    >
+                      <CheckCircle2 className="h-4 w-4" />
+                      Tasdiqlash
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-9 gap-1 rounded-xl px-3"
+                    disabled={busyId === l.id}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void pdf(l);
+                    }}
+                  >
+                    {busyId === l.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileDown className="h-4 w-4" />}
+                    PDF
+                  </Button>
+                  {canDelete ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-9 w-9 shrink-0 rounded-xl border-red-200 p-0 text-red-600 hover:bg-red-50"
+                      title="O‘chirish"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setConfirmIds([l.id]);
+                      }}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  ) : null}
+                </div>
+              </li>
+            ))}
+          </ul>
+
+          {list.length > shown.length ? (
+            <div className="flex justify-center">
+              <Button type="button" variant="outline" className="h-10 rounded-xl" onClick={() => setLimit((n) => n + PAGE)}>
+                Yana ko‘rsatish ({shown.length} / {list.length})
+              </Button>
+            </div>
+          ) : null}
+        </>
+      )}
+
+      <ExplanationLetterDialog letterId={openId} mode="admin" onClose={() => setOpenId(null)} />
+      <LetterHeaderDialog open={headerOpen} onClose={() => setHeaderOpen(false)} />
+
+      <AlertDialog open={confirmIds != null} onOpenChange={(o) => !o && !del.isPending && setConfirmIds(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {confirmIds?.length === 1 ? "Tushuntirish xatini o‘chirasizmi?" : `${confirmIds?.length ?? 0} ta tushuntirish xatini o‘chirasizmi?`}
+            </AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2 text-sm">
+                <p>
+                  Xat tizimdan <b>butunlay</b> o‘chiriladi — xodimda ham, ro‘yxatda ham shu holat yo‘qoladi (sabab, imzo, qaror).
+                  Jarima va bosqich hisobidan chiqadi, qayta yaratilmaydi. Qolgan xatlarning bosqichi qayta tartiblanadi;
+                  keyingi kechikish/kelmaslik yana <b>1-holat</b>dan boshlanadi. Amalni ortga qaytarib bo‘lmaydi.
+                </p>
+                {confirmLetters.length ? (
+                  <ul className="max-h-40 space-y-0.5 overflow-y-auto rounded-xl bg-slate-50 p-2 text-[12px] dark:bg-white/5">
+                    {confirmLetters.slice(0, 50).map((l) => (
+                      <li key={l.id} className="flex justify-between gap-2">
+                        <span className="truncate font-semibold text-slate-800 dark:text-slate-100">{l.fullName}</span>
+                        <span className="shrink-0 tabular-nums text-slate-500">
+                          {fmtLetterDate(l.eventDate)} · № {l.letterNo}
+                        </span>
+                      </li>
+                    ))}
+                    {confirmLetters.length > 50 ? <li className="text-slate-500">… va yana {confirmLetters.length - 50} ta</li> : null}
+                  </ul>
+                ) : null}
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={del.isPending}>Bekor</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-red-600 text-white hover:bg-red-700"
+              disabled={del.isPending}
+              onClick={(e) => {
+                e.preventDefault();
+                runDelete();
+              }}
+            >
+              {del.isPending ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <Trash2 className="mr-1.5 h-4 w-4" />}
+              O‘chirish
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}
+
+function ScannerInboxPanel({ enabled }: { enabled: boolean }) {
+  const { toast } = useToast();
+  const qc = useQueryClient();
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [confirmOne, setConfirmOne] = useState<ScannerDoc | null>(null);
+  const q = useQuery({
+    queryKey: ["scanner-docs", "inbox"],
+    queryFn: fetchScannerDocsInbox,
+    enabled,
+    refetchInterval: 60_000,
+  });
+  const clearMut = useMutation({
+    mutationFn: clearAllScannerDocs,
+    onSuccess: (r) => {
+      void qc.invalidateQueries({ queryKey: ["scanner-docs"] });
+      setConfirmClear(false);
+      toast({
+        title: "Tozalandi",
+        description: `${r.deleted} ta skaner PDF bazadan o‘chirildi`,
+      });
+    },
+    onError: (e) => {
+      toast({ title: "O‘chirilmadi", description: (e as Error).message, variant: "destructive" });
+    },
+  });
+  const deleteOneMut = useMutation({
+    mutationFn: (id: number) => deleteScannerDoc(id),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["scanner-docs"] });
+      setConfirmOne(null);
+      toast({ title: "O‘chirildi", description: "Skaner PDF bazadan o‘chirildi" });
+    },
+    onError: (e) => {
+      toast({ title: "O‘chirilmadi", description: (e as Error).message, variant: "destructive" });
+    },
+  });
+  const items = q.data ?? [];
+  if (!enabled) return null;
+  return (
+    <section className="rounded-2xl border border-violet-200 bg-violet-50/50 p-3 dark:border-violet-500/25 dark:bg-violet-500/5">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-violet-600 text-white">
+          <ScanLine className="h-4 w-4" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-bold text-slate-900 dark:text-white">Tizim skaneri · kelgan PDF lar</p>
+          <p className="text-[11px] text-slate-500">
+            Kim skaner qilsa — shu yerga va Telegram TX guruhiga tushadi. 1 soatdan keyin bazadan o‘chadi.
+          </p>
+        </div>
+        <span className="rounded-full bg-violet-600/15 px-2.5 py-1 text-xs font-bold tabular-nums text-violet-800 dark:text-violet-200">
+          {q.isLoading ? "…" : items.length}
+        </span>
+        {items.length > 0 && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 gap-1 rounded-lg border-rose-200 bg-white text-rose-700 hover:bg-rose-50 hover:text-rose-800 dark:border-rose-500/30 dark:bg-transparent dark:text-rose-300"
+            onClick={() => setConfirmClear(true)}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            Barchasini o‘chirish
+          </Button>
+        )}
+      </div>
+      {q.isLoading ? (
+        <p className="py-3 text-center text-xs text-slate-500">Yuklanmoqda…</p>
+      ) : !items.length ? (
+        <p className="py-3 text-center text-xs text-slate-500">Hozircha faol skaner fayli yo‘q</p>
+      ) : (
+        <ul className="max-h-48 space-y-1.5 overflow-y-auto">
+          {items.map((d: ScannerDoc) => (
+            <li
+              key={d.id}
+              className="flex flex-wrap items-center gap-2 rounded-xl border border-violet-100 bg-white px-2.5 py-2 text-xs dark:border-white/10 dark:bg-slate-900/60"
+            >
+              <span className="min-w-0 flex-1 truncate font-semibold text-slate-800 dark:text-slate-100">
+                {d.filename}
+                <span className="ml-1.5 font-normal text-slate-500">
+                  · {d.userName || "—"}
+                  {d.userRole ? ` (${d.userRole})` : ""} · {d.pageCount} sahifa
+                </span>
+              </span>
+              <span className="tabular-nums text-violet-700 dark:text-violet-300">
+                {formatExpiresIn(d.expiresInSec)}
+              </span>
+              <a
+                href={scannerDocDownloadUrl(d.id)}
+                className="inline-flex h-7 items-center gap-1 rounded-lg bg-violet-600 px-2 font-semibold text-white hover:bg-violet-500"
+              >
+                <FileDown className="h-3.5 w-3.5" />
+                Yuklash
+              </a>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1 rounded-lg border-rose-200 px-2 text-rose-700 hover:bg-rose-50 hover:text-rose-800 dark:border-rose-500/30 dark:text-rose-300"
+                disabled={deleteOneMut.isPending && confirmOne?.id === d.id}
+                onClick={() => setConfirmOne(d)}
+                aria-label="O‘chirish"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                O‘chirish
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <AlertDialog open={confirmClear} onOpenChange={(o) => !o && !clearMut.isPending && setConfirmClear(false)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Barcha skaner PDF larni o‘chirish?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {items.length} ta fayl bazadan va saqlashdan butunlay o‘chiriladi. Bu amalni qaytarib bo‘lmaydi.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={clearMut.isPending}>Bekor</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-rose-600 hover:bg-rose-700"
+              disabled={clearMut.isPending}
+              onClick={(e) => {
+                e.preventDefault();
+                clearMut.mutate();
+              }}
+            >
+              {clearMut.isPending ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <Trash2 className="mr-1.5 h-4 w-4" />}
+              Ha, barchasini o‘chirish
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={!!confirmOne}
+        onOpenChange={(o) => !o && !deleteOneMut.isPending && setConfirmOne(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Shu PDF ni o‘chirish?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {confirmOne
+                ? `«${confirmOne.filename}» bazadan va saqlashdan o‘chiriladi. Qaytarib bo‘lmaydi.`
+                : null}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleteOneMut.isPending}>Bekor</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-rose-600 hover:bg-rose-700"
+              disabled={deleteOneMut.isPending || !confirmOne}
+              onClick={(e) => {
+                e.preventDefault();
+                if (confirmOne) deleteOneMut.mutate(confirmOne.id);
+              }}
+            >
+              {deleteOneMut.isPending ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <Trash2 className="mr-1.5 h-4 w-4" />}
+              Ha, o‘chirish
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </section>
+  );
+}
+
+function ReportPanel() {
+  const { toast } = useToast();
+  const sched = useLetterReportSchedule(true);
+  const send = useSendLetterReport();
+  const [downloading, setDownloading] = useState(false);
+  const s = sched.data;
+
+  const excel = async () => {
+    setDownloading(true);
+    try {
+      await downloadLettersReportExcel();
+    } catch (e) {
+      toast({ title: "Excel", description: (e as Error).message, variant: "destructive" });
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  return (
+    <section className="flex flex-col gap-3 rounded-2xl border border-emerald-200 bg-emerald-50/60 p-3 sm:flex-row sm:items-center dark:border-emerald-500/30 dark:bg-emerald-500/5">
+      <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-600 text-white">
+        <FileSpreadsheet className="h-5 w-5" />
+      </span>
+      <div className="min-w-0 flex-1 text-[12px] leading-snug text-slate-600 dark:text-slate-300">
+        <p className="text-sm font-bold text-slate-900 dark:text-white">Telegram hisobot — har {s?.everyDays ?? 3} kunda soat {String(s?.hour ?? 10).padStart(2, "0")}:00</p>
+        <p>
+          Barcha xatlar Excelda (ism, filial, sabab, izoh, filtr bilan) va asl xatlar PDF ko‘rinishida — tasdiqlangan, tasdiqlanmagan,
+          bekor qilingan alohida fayllarda.
+        </p>
+        <p className="mt-0.5 tabular-nums text-slate-500">
+          {sched.isLoading
+            ? "Yuklanmoqda…"
+            : s
+              ? `Oxirgi: ${s.lastSentOn ? fmtLetterDate(s.lastSentOn) : "hali yuborilmagan"} · Keyingisi: ${fmtLetterDate(s.nextSendOn)} 10:00 · Guruh ${s.chatId}`
+              : "Holat yuklanmadi"}
+        </p>
+      </div>
+      <div className="flex gap-2">
+        <Button type="button" variant="outline" className="h-10 flex-1 gap-1.5 rounded-xl sm:flex-none" disabled={downloading} onClick={() => void excel()}>
+          {downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileDown className="h-4 w-4" />}
+          Excel
+        </Button>
+        <Button
+          type="button"
+          className="h-10 flex-1 gap-1.5 rounded-xl bg-emerald-600 text-white hover:bg-emerald-700 sm:flex-none"
+          disabled={send.isPending}
+          onClick={() =>
+            send.mutate(undefined, {
+              onSuccess: (r) => toast({ title: "Telegramga yuborildi", description: `Excel yuborildi (${r.totals.all} ta xat). Asl PDF xatlar bir necha daqiqada keladi.` }),
+              onError: (e) => toast({ title: "Yuborilmadi", description: (e as Error).message, variant: "destructive" }),
+            })
+          }
+        >
+          {send.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+          Hozir yuborish
+        </Button>
+      </div>
+    </section>
+  );
+}
+
+function KindBadge({ l }: { l: ExplanationLetter }) {
+  return l.kind === "late" ? (
+    <span className="inline-flex items-center gap-1 rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-bold text-orange-800 dark:bg-orange-500/20 dark:text-orange-200">
+      <Clock3 className="h-3 w-3" /> Kechikish
+    </span>
+  ) : (
+    <span className="inline-flex items-center gap-1 rounded-full bg-red-100 px-2 py-0.5 text-[11px] font-bold text-red-700 dark:bg-red-500/20 dark:text-red-200">
+      <CalendarX2 className="h-3 w-3" /> Kelmagan
+    </span>
+  );
+}
+
+function IconBtn({
+  title,
+  onClick,
+  disabled,
+  tone,
+  children,
+}: {
+  title: string;
+  onClick: () => void;
+  disabled?: boolean;
+  tone?: "success" | "danger";
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      disabled={disabled}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      className={cn(
+        "flex h-8 w-8 items-center justify-center rounded-lg border transition disabled:opacity-50",
+        tone === "success"
+          ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-200"
+          : tone === "danger"
+            ? "border-red-200 text-red-600 hover:bg-red-50 dark:border-red-500/30 dark:text-red-300 dark:hover:bg-red-500/10"
+            : "border-slate-200 text-slate-600 hover:border-sky-300 hover:bg-sky-50 hover:text-sky-800 dark:border-white/10 dark:text-slate-300 dark:hover:bg-white/5",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Segmented<T extends string>({
+  value,
+  onChange,
+  options,
+}: {
+  value: T;
+  onChange: (v: T) => void;
+  options: ReadonlyArray<readonly [T, string, number | null]>;
+}) {
+  return (
+    <div className="grid w-max min-w-full auto-cols-fr grid-flow-col rounded-xl bg-slate-100 p-1 dark:bg-white/5">
+      {options.map(([key, label, count]) => (
+        <button
+          key={key}
+          type="button"
+          onClick={() => onChange(key)}
+          className={cn(
+            "inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-xs font-semibold transition",
+            value === key ? "bg-white text-slate-900 shadow-sm dark:bg-slate-800 dark:text-white" : "text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white",
+          )}
+        >
+          {label}
+          {count != null ? (
+            <span className="min-w-[1.25rem] rounded-full bg-slate-200 px-1.5 text-[10px] font-bold tabular-nums text-slate-700 dark:bg-white/10 dark:text-slate-200">{count}</span>
+          ) : null}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Stat({ label, value, loading, tone }: { label: string; value: number; loading: boolean; tone: string }) {
+  return (
+    <div className={cn("flex items-center justify-between gap-2 rounded-2xl px-3 py-2.5 ring-1", tone)}>
+      <p className="text-[11px] font-bold uppercase tracking-wide">{label}</p>
+      <span className="text-xl font-extrabold tabular-nums">{loading ? "…" : value}</span>
+    </div>
+  );
+}
+
+function FilterSelect({
+  icon,
+  label,
+  allLabel,
+  value,
+  onChange,
+  options,
+}: {
+  icon: ReactNode;
+  label: string;
+  allLabel: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: [string, number][];
+}) {
+  return (
+    <label
+      className={cn(
+        "relative flex h-10 min-w-0 items-center rounded-xl border bg-white transition sm:w-60 dark:bg-slate-900",
+        value
+          ? "border-sky-300 ring-2 ring-sky-100 dark:border-sky-500/50 dark:ring-sky-500/20"
+          : "border-slate-200 dark:border-white/10",
+      )}
+      title={label}
+    >
+      <span className={cn("pointer-events-none absolute left-3", value ? "text-sky-600" : "text-slate-400")}>{icon}</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        aria-label={label}
+        className="h-full w-full min-w-0 truncate rounded-xl bg-transparent pl-9 pr-3 text-sm font-semibold text-slate-800 outline-none dark:text-white"
+      >
+        <option value="">{allLabel}</option>
+        {options.map(([name, n]) => (
+          <option key={name} value={name}>
+            {name} ({n})
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}

@@ -1,0 +1,485 @@
+export type SmenaBranch = {
+  id: number;
+  name: string;
+  managerName: string;
+  hasGps: boolean;
+};
+
+export type SmenaAssignable = {
+  id: number;
+  fullName: string;
+  orgRole: string | null;
+  shiftType: string;
+  assignedBranchId: number | null;
+  assignedBranchName: string | null;
+};
+
+export type ShiftPick = "one" | "two" | "three" | "one+two" | "two+three";
+export type SlotShiftKey = "one" | "two" | "three" | "one+two" | "two+three";
+export type SlotMode = "permanent" | "period" | "weekly" | "days";
+
+export type SmenaScope = "own" | "all";
+
+/** «Smena va filial» ruxsati: Admin/HR — full; koordinator — Admin bergan ruxsatlar */
+export type SmenaAccess = {
+  full: boolean;
+  canRotate: boolean;
+  canShift: boolean;
+  scope: SmenaScope;
+  any: boolean;
+};
+
+export type SmenaMe = {
+  access?: SmenaAccess;
+  pharmacyStaff: boolean;
+  canPickShift: boolean;
+  canPickOwnBranch: boolean;
+  canAssignOthers: boolean;
+  canDayRotate?: boolean;
+  canManageSlots?: boolean;
+  viewOnly?: boolean;
+  employee: {
+    id: number;
+    fullName: string;
+    orgRole: string | null;
+    assignedBranchId: number | null;
+    assignedBranchName: string | null;
+  } | null;
+  shift: {
+    type: string;
+    types?: string[];
+    label: string;
+    start: string;
+    end: string;
+    warnHm: string;
+    warnText: string;
+    hoursNote: string;
+    windows?: Array<{ type: string; label: string; start: string; end: string; overnight?: boolean }>;
+  };
+  branches: SmenaBranch[];
+  assignable: SmenaAssignable[];
+  rules: {
+    eligible?: string;
+    office?: string;
+    shift1: string;
+    shift2: string;
+    shift3?: string;
+    combo?: string;
+    branch: string;
+  };
+};
+
+export type SmenaRotationItem = {
+  id: number;
+  employeeId: number;
+  fullName: string;
+  orgRole: string | null;
+  branchId: number;
+  branchLabel: string | null;
+  workDate?: string;
+  shiftKeys: string[];
+  note: string | null;
+  createdAt?: string;
+};
+
+export type StaffMonitoringItem = {
+  employeeId: number;
+  fullName: string;
+  orgRole: string | null;
+  primaryBranchId: number | null;
+  primaryBranchName: string | null;
+  todayBranchId: number | null;
+  todayBranchLabel: string | null;
+  todayShiftKey: string;
+  todayShiftLabel: string;
+  todayMode: string;
+  todayModeLabel: string;
+  slotsCount: number;
+};
+
+export type WorkSlotItem = {
+  id: number;
+  employeeId: number;
+  branchId: number;
+  branchLabel: string | null;
+  shiftKey: SlotShiftKey;
+  mode: SlotMode;
+  validFrom: string;
+  validTo: string | null;
+  weekdays: number[] | null;
+  workDates: string[] | null;
+  overrideBase?: boolean;
+  note: string | null;
+  active?: boolean;
+  modeLabel?: string;
+  shiftLabel?: string;
+  fullName?: string;
+  orgRole?: string | null;
+  primaryBranchId?: number | null;
+  primaryBranchName?: string | null;
+  createdAt?: string;
+  createdByName?: string;
+  isExpired?: boolean;
+};
+
+async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`/api${path}`, {
+    credentials: "include",
+    headers: {
+      Accept: "application/json",
+      ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...init?.headers,
+    },
+    ...init,
+  });
+  const body = (await res.json().catch(() => ({}))) as { error?: string; message?: string };
+  if (!res.ok) {
+    throw new Error(body.error || body.message || `So‘rov bajarilmadi (kod ${res.status})`);
+  }
+  return body as T;
+}
+
+export function fetchSmenaMe(): Promise<SmenaMe> {
+  return apiJson<SmenaMe>("/smena/me");
+}
+
+export function saveMySmena(body: { shiftType?: ShiftPick | string; assignedBranchId?: number | null }) {
+  return apiJson<{ ok: boolean }>("/smena/me", {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+export function assignSmenaBranch(
+  employeeId: number,
+  assignedBranchId: number | null | undefined,
+  shiftType?: ShiftPick | string,
+) {
+  const body: Record<string, unknown> = {};
+  if (assignedBranchId != null) body.assignedBranchId = assignedBranchId;
+  if (shiftType != null) body.shiftType = shiftType;
+  return apiJson<{
+    ok: boolean;
+    assignedBranchName: string;
+    shiftOnly?: boolean;
+  }>(`/smena/assign/${employeeId}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Filialni o‘zgartirmasdan faqat smena */
+export function changeShiftOnly(employeeId: number, shiftKey: SlotShiftKey | string) {
+  return apiJson<{
+    ok: boolean;
+    shiftOnly: boolean;
+    shiftType: string;
+    shiftLabel: string;
+    branchId: number;
+    branchName: string;
+    message: string;
+  }>(`/smena/shift-only/${employeeId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ shiftKey }),
+  });
+}
+
+export type ShiftBoardOption = {
+  key: SlotShiftKey;
+  label: string;
+  start: string;
+  end: string;
+  overnight: boolean;
+};
+
+export type ShiftBoardStaff = {
+  employeeId: number;
+  fullName: string;
+  orgRole: string | null;
+  branchId: number | null;
+  branchName: string | null;
+  baseShiftKey: SlotShiftKey;
+  todayShiftKey: SlotShiftKey;
+  overrides: Array<{ id: number; shiftKey: SlotShiftKey; weekdays: number[] }>;
+  week: Array<{ weekday: number; shiftKey: SlotShiftKey; override: boolean }>;
+  otherRotations: number;
+  /** Kunora (cherez den): bugun amaldagi yoki keyin boshlanadigan davr */
+  altDays: {
+    anchor: string;
+    end: string | null;
+    todayWork: boolean | null;
+    days: Array<{ date: string; work: boolean | null }>;
+  } | null;
+  /** Faqat shu xodim uchun shaxsiy kelish–ketish vaqti */
+  customHours: {
+    id: number;
+    start: string;
+    end: string;
+    overnight: boolean;
+    mode: "permanent" | "period";
+    validFrom: string;
+    validTo: string | null;
+    note: string | null;
+    activeToday: boolean;
+  } | null;
+};
+
+export type ShiftBoard = {
+  today: string;
+  todayWeekday: number;
+  shiftOptions: ShiftBoardOption[];
+  staff: ShiftBoardStaff[];
+};
+
+export function fetchShiftBoard() {
+  return apiJson<ShiftBoard>("/smena/shift-board");
+}
+
+/** shiftKey = null — tanlangan kunlar asosiy smenaga qaytadi */
+export function saveShiftOverride(body: { employeeId: number; weekdays: number[]; shiftKey: SlotShiftKey | null }) {
+  return apiJson<{ ok: boolean; message: string; cleared: boolean }>("/smena/shift-override", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** anchorDate — birinchi ish kuni; null — kunorani fromDate (standart bugun) dan bekor qilish */
+export function saveAltDays(body: { employeeId: number; anchorDate: string | null; fromDate?: string }) {
+  return apiJson<{ ok: boolean; message: string; cleared: boolean }>("/smena/alt-days", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function saveCustomHours(body: {
+  employeeId: number;
+  start: string;
+  end: string;
+  validFrom?: string;
+  validTo?: string | null;
+  note?: string;
+}) {
+  return apiJson<{ ok: boolean; message: string }>("/smena/custom-hours", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+export function clearCustomHours(employeeId: number) {
+  return apiJson<{ ok: boolean; message: string }>(`/smena/custom-hours/${employeeId}`, { method: "DELETE" });
+}
+
+export function updateWorkSlotShift(slotId: number, shiftKey: SlotShiftKey | string) {
+  return apiJson<{
+    ok: boolean;
+    item: WorkSlotItem;
+    message?: string;
+    unchanged?: boolean;
+  }>(`/smena/slots/${slotId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ shiftKey }),
+  });
+}
+
+export function createDayRotation(body: {
+  employeeId: number;
+  branchId: number;
+  workDate?: string;
+  workDates?: string[];
+  shiftType?: ShiftPick | string;
+  note?: string;
+}) {
+  return apiJson<{
+    ok: boolean;
+    workDate: string;
+    workDates: string[];
+    count: number;
+    branchLabel: string;
+    shiftType: string | null;
+    permanentUnchanged: boolean;
+  }>("/smena/rotation", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function fetchDayRotations(date: string) {
+  return apiJson<{ workDate: string; items: SmenaRotationItem[] }>(
+    `/smena/rotations?date=${encodeURIComponent(date)}`,
+  );
+}
+
+export async function fetchRotationsForDates(dates: string[]) {
+  const uniq = [...new Set(dates.filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)))].sort();
+  if (!uniq.length) return { workDates: [] as string[], items: [] as SmenaRotationItem[] };
+  const results = await Promise.all(uniq.map((d) => fetchDayRotations(d)));
+  const items = results.flatMap((r) =>
+    r.items.map((it) => ({ ...it, workDate: it.workDate || r.workDate })),
+  );
+  items.sort((a, b) => {
+    const da = (a.workDate || "").localeCompare(b.workDate || "");
+    if (da !== 0) return da;
+    return a.fullName.localeCompare(b.fullName, "uz");
+  });
+  return { workDates: uniq, items };
+}
+
+export function deleteDayRotation(id: number) {
+  return apiJson<{ ok: boolean }>(`/smena/rotation/${id}`, { method: "DELETE" });
+}
+
+export function fetchAllWorkSlots() {
+  return apiJson<{ items: WorkSlotItem[]; staffMonitoring?: StaffMonitoringItem[] }>("/smena/slots/all");
+}
+
+export function fetchEmployeeSlots(employeeId: number, date?: string) {
+  const q = new URLSearchParams({ employeeId: String(employeeId) });
+  if (date) q.set("date", date);
+  return apiJson<{ employeeId: number; items: WorkSlotItem[]; daySlots: WorkSlotItem[]; date: string }>(
+    `/smena/slots?${q.toString()}`,
+  );
+}
+
+export function createWorkSlot(body: {
+  employeeId: number;
+  branchId: number;
+  shiftKey: SlotShiftKey;
+  mode: SlotMode;
+  validFrom?: string;
+  validTo?: string | null;
+  weekdays?: number[];
+  workDates?: string[];
+  note?: string;
+}) {
+  return apiJson<{ ok: boolean; item: WorkSlotItem }>("/smena/slots", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteWorkSlot(id: number) {
+  return apiJson<{ ok: boolean }>(`/smena/slots/${id}`, { method: "DELETE" });
+}
+
+export function fetchSmenaAccess() {
+  return apiJson<SmenaAccess>("/smena/access");
+}
+
+export type CoordAccessItem = {
+  userId: number;
+  fullName: string;
+  status: string;
+  employeeId: number | null;
+  hasCard: boolean;
+  branchCount: number;
+  branchNames: string[];
+  staffCount: number;
+  mudirCount: number;
+  canRotate: boolean;
+  canShift: boolean;
+  scope: SmenaScope;
+  grantedByName: string | null;
+  grantedAt: string | null;
+  actionsTotal: number;
+  actions30d: number;
+  lastActionAt: string | null;
+};
+
+export function fetchCoordAccess() {
+  return apiJson<{ items: CoordAccessItem[] }>("/smena/coord-access");
+}
+
+export function saveCoordAccess(userId: number, body: { canRotate: boolean; canShift: boolean; scope: SmenaScope }) {
+  return apiJson<{ ok: boolean }>(`/smena/coord-access/${userId}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+export type SmenaLogAction =
+  | "rotation_create"
+  | "rotation_cancel"
+  | "slot_shift_change"
+  | "shift_change"
+  | "shift_override"
+  | "alt_days"
+  | "custom_hours"
+  | "legacy_assign"
+  | "legacy_day_rotation"
+  | "legacy_day_rotation_cancel"
+  | "perm_change";
+
+export type SmenaHistoryItem = {
+  id: number;
+  createdAt: string;
+  action: SmenaLogAction;
+  source: "live" | "legacy";
+  actorUserId: number | null;
+  actorName: string | null;
+  actorRole: string | null;
+  employeeId: number | null;
+  employeeName: string | null;
+  employeeOrgRole: string | null;
+  fromBranchId: number | null;
+  fromBranchLabel: string | null;
+  toBranchId: number | null;
+  toBranchLabel: string | null;
+  fromShift: string | null;
+  toShift: string | null;
+  mode: string | null;
+  validFrom: string | null;
+  validTo: string | null;
+  weekdays: number[] | null;
+  workDates: string[] | null;
+  note: string | null;
+  summary: string;
+  slotId: number | null;
+  targetUserId: number | null;
+  ip: string | null;
+};
+
+export type SmenaHistoryActor = { userId: number; name: string | null; role: string | null; total: number };
+
+export type SmenaHistoryFilter = {
+  actorUserId?: number | null;
+  employeeId?: number | null;
+  action?: string | null;
+  from?: string | null;
+  to?: string | null;
+  q?: string | null;
+  limit?: number;
+};
+
+export function fetchSmenaHistory(f: SmenaHistoryFilter) {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(f)) {
+    if (v != null && v !== "") q.set(k, String(v));
+  }
+  return apiJson<{ items: SmenaHistoryItem[]; actors: SmenaHistoryActor[]; full: boolean }>(
+    `/smena/history?${q.toString()}`,
+  );
+}
+
+export function shiftLabelShort(type: string | null | undefined): string {
+  const s = String(type || "").toLowerCase();
+  if (s.includes("one+two") || s === "one+two") return "1+2";
+  if (s.includes("two+three") || s === "two+three") return "2+3";
+  if (s === "three" || s.includes("three")) return "3-smena";
+  if (s === "two" || s.startsWith("two")) return "2-smena";
+  if (s === "office") return "Ofis";
+  return "1-smena";
+}
+
+export function todayTashkentYmd() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Tashkent" });
+}
+
+export const WEEKDAY_OPTIONS = [
+  { value: 1, label: "Du" },
+  { value: 2, label: "Se" },
+  { value: 3, label: "Ch" },
+  { value: 4, label: "Pa" },
+  { value: 5, label: "Ju" },
+  { value: 6, label: "Sh" },
+  { value: 7, label: "Ya" },
+] as const;

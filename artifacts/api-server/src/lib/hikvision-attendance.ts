@@ -1,0 +1,529 @@
+import { and, eq, isNotNull, ne } from "drizzle-orm";
+import {
+  attendanceRecordsTable,
+  db,
+  employeesTable,
+  hikvisionEventLogTable,
+  hikvisionPersonMapTable,
+  usersTable,
+} from "@workspace/db";
+import { ensureHikvisionSchema } from "./ensure-schema";
+import { logger } from "./logger";
+
+let schemaReady: Promise<void> | null = null;
+
+function ensureReady() {
+  if (!schemaReady) {
+    schemaReady = ensureHikvisionSchema().catch((err) => {
+      schemaReady = null;
+      throw err;
+    });
+  }
+  return schemaReady;
+}
+
+export type HikvisionAccessEvent = {
+  employeeNo?: string;
+  name?: string;
+  attendanceStatus?: string;
+  label?: string;
+  serialNo?: number;
+  time?: string;
+  majorEventType?: number;
+  subEventType?: number;
+  currentVerifyMode?: string;
+  deviceSerial?: string;
+  /** Qurilmadan kelgan yuz rasmi (data URL) — HR Face ID bilan solishtiriladi */
+  pictureDataUrl?: string;
+  pictureURL?: string;
+  raw?: Record<string, unknown>;
+};
+
+function normalizePersonName(s: string): string {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(/[‘’ʻʼ'`]/g, "")
+    .replace(/[^a-zа-яўқғҳ0-9\s]+/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function nameTokens(s: string): string[] {
+  return normalizePersonName(s).split(" ").filter(Boolean);
+}
+
+function namesLikelyMatch(a: string, b: string): boolean {
+  const na = normalizePersonName(a);
+  const nb = normalizePersonName(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const ta = nameTokens(a);
+  const tb = nameTokens(b);
+  if (ta.length < 2 || tb.length < 2) return false;
+  const setA = new Set(ta);
+  const setB = new Set(tb);
+  let shared = 0;
+  for (const t of setA) if (setB.has(t)) shared += 1;
+  // Kamida familiya + ism mos
+  return shared >= 2 && (shared >= Math.min(ta.length, tb.length) || shared / Math.max(ta.length, tb.length) >= 0.66);
+}
+
+export function actionFromAttendanceStatus(
+  status?: string | null,
+  label?: string | null,
+): "in" | "out" | "auto" {
+  const s = String(status || "").toLowerCase();
+  const l = String(label || "").toLowerCase();
+  if (
+    s === "checkin" ||
+    s === "breakin" ||
+    s === "overtimein" ||
+    /keldim|check\s*in|вход|приш/i.test(l)
+  ) {
+    return "in";
+  }
+  if (
+    s === "checkout" ||
+    s === "breakout" ||
+    s === "overtimeout" ||
+    /ketdim|ketdi|check\s*out|выход|уш[её]л/i.test(l)
+  ) {
+    return "out";
+  }
+  return "auto";
+}
+
+/** Face authentication success event (minor 75 = attendance / face pass on this firmware) */
+export function isAttendanceWorthyEvent(ev: HikvisionAccessEvent): boolean {
+  if (ev.pictureDataUrl) return true;
+  const hasPerson = Boolean(ev.employeeNo || ev.name);
+  if (!hasPerson) return false;
+  // Explicit attendance status
+  if (ev.attendanceStatus && ev.attendanceStatus !== "undefined") return true;
+  if (ev.label && /keldim|ketdim|ketdi|check/i.test(ev.label)) return true;
+  // Access granted with face/card (major 5 = event)
+  if (ev.majorEventType === 5 && (ev.subEventType === 75 || ev.subEventType === 1 || ev.subEventType === 38)) {
+    return true;
+  }
+  return Boolean(ev.employeeNo && (ev.currentVerifyMode || "").toLowerCase().includes("face"));
+}
+
+export function parseHikvisionPayload(body: unknown): HikvisionAccessEvent | null {
+  if (body == null) return null;
+  let obj: Record<string, unknown> | null = null;
+  if (typeof body === "string") {
+    const t = body.trim();
+    if (!t) return null;
+    if (t.startsWith("{")) {
+      try {
+        obj = JSON.parse(t) as Record<string, unknown>;
+      } catch {
+        return null;
+      }
+    } else if (t.includes("<")) {
+      // Minimal XML field extract
+      const pick = (tag: string) => {
+        const m = t.match(new RegExp(`<${tag}[^>]*>([^<]*)</${tag}>`, "i"));
+        return m?.[1]?.trim();
+      };
+      return {
+        employeeNo: pick("employeeNoString") || pick("employeeNo"),
+        name: pick("name"),
+        attendanceStatus: pick("attendanceStatus"),
+        label: pick("label"),
+        serialNo: Number(pick("serialNo") || "") || undefined,
+        time: pick("time") || pick("dateTime"),
+        majorEventType: Number(pick("majorEventType") || pick("major") || "") || undefined,
+        subEventType: Number(pick("subEventType") || pick("minor") || "") || undefined,
+        currentVerifyMode: pick("currentVerifyMode"),
+        raw: { xml: t.slice(0, 2000) },
+      };
+    } else {
+      return null;
+    }
+  } else if (typeof body === "object") {
+    obj = body as Record<string, unknown>;
+  }
+  if (!obj) return null;
+
+  const ac =
+    (obj.AccessControllerEvent as Record<string, unknown> | undefined) ||
+    (obj.accessControllerEvent as Record<string, unknown> | undefined) ||
+    obj;
+
+  const employeeNo = String(
+    ac.employeeNoString ?? ac.employeeNo ?? obj.employeeNoString ?? obj.employeeNo ?? "",
+  ).trim();
+  const name = String(ac.name ?? obj.name ?? "").trim();
+  const attendanceStatus = String(ac.attendanceStatus ?? obj.attendanceStatus ?? "").trim();
+  const label = String(ac.label ?? obj.label ?? "").trim();
+  const serialNo = Number(ac.serialNo ?? obj.serialNo ?? 0) || undefined;
+  const time = String(ac.time ?? obj.dateTime ?? obj.time ?? "").trim() || undefined;
+  const majorEventType = Number(ac.majorEventType ?? ac.major ?? obj.majorEventType ?? 0) || undefined;
+  const subEventType = Number(ac.subEventType ?? ac.minor ?? obj.subEventType ?? 0) || undefined;
+  const currentVerifyMode = String(ac.currentVerifyMode ?? obj.currentVerifyMode ?? "").trim();
+  const deviceSerial = String(obj.macAddress ?? ac.macAddress ?? obj.ipAddress ?? "default").trim();
+  const pictureURL = String(ac.pictureURL ?? obj.pictureURL ?? "").trim() || undefined;
+
+  return {
+    employeeNo: employeeNo || undefined,
+    name: name || undefined,
+    attendanceStatus: attendanceStatus || undefined,
+    label: label || undefined,
+    serialNo,
+    time,
+    majorEventType,
+    subEventType,
+    currentVerifyMode: currentVerifyMode || undefined,
+    deviceSerial,
+    pictureURL,
+    raw: obj,
+  };
+}
+
+async function resolveUserForEmployeeNo(
+  employeeNo: string,
+  deviceName?: string,
+): Promise<{ userId: number; employeeId: number | null; matchedBy: string } | null> {
+  const [mapped] = await db
+    .select()
+    .from(hikvisionPersonMapTable)
+    .where(eq(hikvisionPersonMapTable.employeeNo, employeeNo))
+    .limit(1);
+  if (mapped) {
+    if (deviceName && deviceName !== mapped.deviceName) {
+      await db
+        .update(hikvisionPersonMapTable)
+        .set({ deviceName, updatedAt: new Date() })
+        .where(eq(hikvisionPersonMapTable.id, mapped.id));
+    }
+    return { userId: mapped.userId, employeeId: mapped.employeeId, matchedBy: mapped.matchedBy };
+  }
+
+  if (!deviceName) return null;
+
+  const users = await db
+    .select({
+      id: usersTable.id,
+      fullName: usersTable.fullName,
+      status: usersTable.status,
+    })
+    .from(usersTable)
+    .where(eq(usersTable.status, "active"));
+
+  const hit = users.find((u) => namesLikelyMatch(u.fullName, deviceName));
+  if (!hit) {
+    const emps = await db
+      .select({
+        id: employeesTable.id,
+        userId: employeesTable.userId,
+        fullName: employeesTable.fullName,
+        employmentStatus: employeesTable.employmentStatus,
+      })
+      .from(employeesTable)
+      .where(
+        and(
+          ne(employeesTable.employmentStatus, "dismissed"),
+          ne(employeesTable.employmentStatus, "closed"),
+          isNotNull(employeesTable.userId),
+        ),
+      );
+    const empHit = emps.find((e) => namesLikelyMatch(e.fullName, deviceName) && e.userId);
+    if (!empHit?.userId) return null;
+    await db
+      .insert(hikvisionPersonMapTable)
+      .values({
+        employeeNo,
+        userId: empHit.userId,
+        employeeId: empHit.id,
+        deviceName,
+        matchedBy: "auto_name",
+      })
+      .onConflictDoNothing({ target: hikvisionPersonMapTable.employeeNo });
+    return { userId: empHit.userId, employeeId: empHit.id, matchedBy: "auto_name" };
+  }
+
+  const [emp] = await db
+    .select({ id: employeesTable.id })
+    .from(employeesTable)
+    .where(eq(employeesTable.userId, hit.id))
+    .limit(1);
+
+  await db
+    .insert(hikvisionPersonMapTable)
+    .values({
+      employeeNo,
+      userId: hit.id,
+      employeeId: emp?.id ?? null,
+      deviceName,
+      matchedBy: "auto_name",
+    })
+    .onConflictDoNothing({ target: hikvisionPersonMapTable.employeeNo });
+
+  return { userId: hit.id, employeeId: emp?.id ?? null, matchedBy: "auto_name" };
+}
+
+async function resolveAutoAction(userId: number): Promise<"in" | "out"> {
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Tashkent" });
+  const [emp] = await db
+    .select({ id: employeesTable.id })
+    .from(employeesTable)
+    .where(eq(employeesTable.userId, userId))
+    .limit(1);
+  if (!emp) return "in";
+  const [row] = await db
+    .select({
+      checkInAt: attendanceRecordsTable.checkInAt,
+      checkOutAt: attendanceRecordsTable.checkOutAt,
+      status: attendanceRecordsTable.status,
+    })
+    .from(attendanceRecordsTable)
+    .where(and(eq(attendanceRecordsTable.employeeId, emp.id), eq(attendanceRecordsTable.workDate, today)))
+    .limit(1);
+  if (!row?.checkInAt) return "in";
+  if (row.checkOutAt || row.status === "absent" || row.status === "leave") return "in";
+  return "out";
+}
+
+export async function processHikvisionEvent(
+  ev: HikvisionAccessEvent,
+): Promise<{
+  ok: boolean;
+  skipped?: boolean;
+  reason?: string;
+  action?: string;
+  userId?: number;
+  fullName?: string;
+  matchMode?: string;
+  payload?: Record<string, unknown>;
+}> {
+  await ensureReady();
+
+  if (!isAttendanceWorthyEvent(ev)) {
+    return { ok: true, skipped: true, reason: "not_attendance_event" };
+  }
+
+  const employeeNo = String(ev.employeeNo || "").trim();
+  const deviceSerial = String(ev.deviceSerial || "default").slice(0, 64);
+  const eventKey =
+    ev.serialNo != null
+      ? `${deviceSerial}:${ev.serialNo}`
+      : `${deviceSerial}:${employeeNo || "face"}:${ev.time || ""}:${ev.attendanceStatus || ""}:${ev.label || ""}`;
+
+  const [existingLog] = await db
+    .select({ id: hikvisionEventLogTable.id, result: hikvisionEventLogTable.result })
+    .from(hikvisionEventLogTable)
+    .where(eq(hikvisionEventLogTable.eventKey, eventKey))
+    .limit(1);
+  if (existingLog && existingLog.result !== "received") {
+    return { ok: true, skipped: true, reason: "duplicate_event" };
+  }
+  if (!existingLog) {
+    try {
+      await db.insert(hikvisionEventLogTable).values({
+        deviceSerial,
+        eventSerial: ev.serialNo ?? null,
+        eventKey,
+        employeeNo: employeeNo || null,
+        action: null,
+        attendanceStatus: ev.attendanceStatus || null,
+        result: "received",
+        payload: {
+          hasPicture: Boolean(ev.pictureDataUrl),
+          employeeNo,
+          name: ev.name,
+          serialNo: ev.serialNo,
+          attendanceStatus: ev.attendanceStatus,
+          label: ev.label,
+        },
+      });
+    } catch (err) {
+      const msg = `${err instanceof Error ? err.message : String(err)} ${
+        err && typeof err === "object" && "cause" in err ? String((err as { cause?: unknown }).cause) : ""
+      }`;
+      if (/unique|duplicate/i.test(msg)) {
+        return { ok: true, skipped: true, reason: "duplicate_event" };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Identifikatsiya:
+   * - employeeNo map bo‘lsa → 1:1 Face ID (tez). AI ishlamasa ham qurilma yuzni tasdiqlagan — map ishlatiladi.
+   * - map yo‘q → gallery Face ID.
+   */
+  let userId: number | null = null;
+  let matchMode = "";
+  const hintMap = employeeNo ? await resolveUserForEmployeeNo(employeeNo, ev.name) : null;
+
+  /**
+   * Bog‘langan employeeNo → darhol punch (qurilma yuzni o‘zi tasdiqlagan).
+   * AI gallery sekin — qurilma timeout qilib eventni yo‘qotardi.
+   * Rasm bo‘lsa fonida 1:1 solishtirish loglanadi (bloklamaydi).
+   */
+  if (hintMap) {
+    userId = hintMap.userId;
+    matchMode = `map_device:${hintMap.matchedBy}`;
+    if (ev.pictureDataUrl) {
+      void import("./face-ai-verify")
+        .then(({ identifyFromTerminalSnapshot }) =>
+          identifyFromTerminalSnapshot(ev.pictureDataUrl!, {
+            preferUserId: hintMap.userId,
+            preferOnly: true,
+          }),
+        )
+        .then((face) => {
+          if (face.ok) {
+            logger.info(
+              { employeeNo, userId: face.userId, mode: face.mode, confidence: face.confidence },
+              "terminal background Face ID confirm ok",
+            );
+          } else {
+            logger.warn(
+              { employeeNo, userId: hintMap.userId, code: face.code },
+              "terminal background Face ID confirm fail",
+            );
+          }
+        })
+        .catch((err) =>
+          logger.warn(
+            { employeeNo, err: err instanceof Error ? err.message : "error" },
+            "terminal background Face ID error",
+          ),
+        );
+    }
+  } else if (ev.pictureDataUrl) {
+    const { identifyFromTerminalSnapshot } = await import("./face-ai-verify");
+    const face = await identifyFromTerminalSnapshot(ev.pictureDataUrl);
+    if (!face.ok) {
+      logger.warn({ employeeNo, name: ev.name, code: face.code }, "Hikvision face not matched to HR Face ID");
+      await db
+        .update(hikvisionEventLogTable)
+        .set({ result: "face_mismatch", error: `${face.code}: ${face.error}` })
+        .where(eq(hikvisionEventLogTable.eventKey, eventKey));
+      return { ok: false, reason: face.code, payload: { error: face.error, code: face.code } };
+    }
+    userId = face.userId;
+    matchMode = `face:${face.mode}`;
+    if (employeeNo) {
+      await upsertHikvisionMapping({
+        employeeNo,
+        userId: face.userId,
+        deviceName: ev.name,
+      }).catch(() => undefined);
+    }
+  } else {
+    await db
+      .update(hikvisionEventLogTable)
+      .set({
+        result: "no_face_photo",
+        error: "Qurilmadan yuz rasmi kelmadi va xodim bog‘lanmagan",
+      })
+      .where(eq(hikvisionEventLogTable.eventKey, eventKey));
+    return { ok: false, reason: "no_face_photo" };
+  }
+
+  let action = actionFromAttendanceStatus(ev.attendanceStatus, ev.label);
+  if (action === "auto") {
+    action = await resolveAutoAction(userId);
+  }
+
+  const note = [
+    "Ofis Face ID terminali",
+    matchMode.startsWith("face:") ? "· HR Face ID mos" : "· map",
+    ev.label ? `· ${ev.label}` : "",
+    employeeNo ? `· №${employeeNo}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .slice(0, 500);
+
+  const { punchFromHikvisionTerminal } = await import("../routes/davomat");
+  const punched = await punchFromHikvisionTerminal({
+    userId,
+    action,
+    note,
+  });
+
+  if (!punched.ok) {
+    await db
+      .update(hikvisionEventLogTable)
+      .set({
+        action,
+        userId,
+        result: "denied",
+        error: String(punched.body.error || punched.body.code || "denied"),
+      })
+      .where(eq(hikvisionEventLogTable.eventKey, eventKey));
+    return {
+      ok: false,
+      reason: String(punched.body.code || "punch_denied"),
+      action,
+      userId,
+      matchMode,
+      payload: punched.body,
+    };
+  }
+
+  await db
+    .update(hikvisionEventLogTable)
+    .set({
+      action,
+      userId,
+      result: "ok",
+      error: null,
+    })
+    .where(eq(hikvisionEventLogTable.eventKey, eventKey));
+
+  return {
+    ok: true,
+    action,
+    userId,
+    matchMode,
+    fullName: String(punched.payload.fullName || ev.name || ""),
+    payload: punched.payload,
+  };
+}
+
+export async function upsertHikvisionMapping(opts: {
+  employeeNo: string;
+  userId: number;
+  deviceName?: string;
+}): Promise<void> {
+  await ensureReady();
+  const employeeNo = String(opts.employeeNo).trim();
+  const [emp] = await db
+    .select({ id: employeesTable.id })
+    .from(employeesTable)
+    .where(eq(employeesTable.userId, opts.userId))
+    .limit(1);
+  const [existing] = await db
+    .select()
+    .from(hikvisionPersonMapTable)
+    .where(eq(hikvisionPersonMapTable.employeeNo, employeeNo))
+    .limit(1);
+  if (existing) {
+    await db
+      .update(hikvisionPersonMapTable)
+      .set({
+        userId: opts.userId,
+        employeeId: emp?.id ?? null,
+        deviceName: opts.deviceName || existing.deviceName,
+        matchedBy: "manual",
+        updatedAt: new Date(),
+      })
+      .where(eq(hikvisionPersonMapTable.id, existing.id));
+    return;
+  }
+  await db.insert(hikvisionPersonMapTable).values({
+    employeeNo,
+    userId: opts.userId,
+    employeeId: emp?.id ?? null,
+    deviceName: opts.deviceName || null,
+    matchedBy: "manual",
+  });
+}

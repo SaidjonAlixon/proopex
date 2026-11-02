@@ -1,0 +1,25 @@
+{
+  "name": "PROOPEX",
+  "short_name": "PROOPEX",
+  "description": "PROOPEX — xodimi bor har qanday kompaniya uchun HR platforma",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#05050c",
+  "theme_color": "#05050c",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/proopex-icon.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/proopex-icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

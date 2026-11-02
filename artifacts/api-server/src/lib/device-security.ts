@@ -1,0 +1,739 @@
+import { createHash, randomBytes } from "crypto";
+import type { Request, Response } from "express";
+import { and, desc, eq, isNull, ne } from "drizzle-orm";
+import {
+  db,
+  usersTable,
+  deviceSecuritySettingsTable,
+  userDevicesTable,
+  userSessionsTable,
+  loginAuditLogsTable,
+  securityEventsTable,
+  deviceChangeRequestsTable,
+} from "@workspace/db";
+import { isProdEnv } from "./session";
+import { isStudentRole } from "./roles";
+
+export const DEVICE_COOKIE = "device_cred";
+export const SECURE_SESSION_COOKIE = "session";
+export const LEGACY_SESSION_PREFIX = "legacy:";
+
+export type StaffGroup = "office" | "pharmacy";
+export type EnforcementMode = "off" | "selected" | "office" | "pharmacy" | "all";
+
+export type DeviceSecuritySettings = {
+  id: number;
+  enforcementMode: EnforcementMode;
+  officeMaxDevices: number;
+  pharmacyMaxDevices: number;
+  officeRequireApprove: boolean;
+  pharmacyRequireApprove: boolean;
+  officeBlockForeign: boolean;
+  pharmacyBlockForeign: boolean;
+  officeVerifyQr: boolean;
+  pharmacyVerifyQr: boolean;
+  officeVerifyFace: boolean;
+  pharmacyVerifyFace: boolean;
+  logIpChanges: boolean;
+  suspiciousNotify: boolean;
+};
+
+const PHARMACY_ROLES = new Set(["mudir", "farmasevt", "stajyor", "koordinator"]);
+
+export function staffGroupForRole(role?: string | null): StaffGroup {
+  return PHARMACY_ROLES.has(String(role || "").toLowerCase()) ? "pharmacy" : "office";
+}
+
+export function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+export function randomToken(bytes = 32): string {
+  return randomBytes(bytes).toString("base64url");
+}
+
+export function clientIp(req: Request): string {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf.trim()) return xf.split(",")[0]!.trim();
+  return req.socket.remoteAddress || "";
+}
+
+export type DeviceMeta = {
+  deviceName?: string;
+  deviceType?: string;
+  os?: string;
+  osVersion?: string;
+  browser?: string;
+  browserVersion?: string;
+  userAgent?: string;
+};
+
+export function parseDeviceMeta(body: unknown, uaHeader?: string): DeviceMeta {
+  const b = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
+  const ua = String(b.userAgent || uaHeader || "");
+  const isMobile = /Mobile|Android|iPhone|iPad/i.test(ua);
+  const isTablet = /iPad|Tablet/i.test(ua);
+  let browser = String(b.browser || "");
+  let os = String(b.os || "");
+  if (!browser) {
+    if (/Edg\//i.test(ua)) browser = "Edge";
+    else if (/Chrome\//i.test(ua)) browser = "Chrome";
+    else if (/Firefox\//i.test(ua)) browser = "Firefox";
+    else if (/Safari\//i.test(ua) && !/Chrome/i.test(ua)) browser = "Safari";
+    else browser = "Unknown";
+  }
+  if (!os) {
+    if (/Windows/i.test(ua)) os = "Windows";
+    else if (/Android/i.test(ua)) os = "Android";
+    else if (/iPhone|iPad|iOS/i.test(ua)) os = "iOS";
+    else if (/Mac OS/i.test(ua)) os = "macOS";
+    else if (/Linux/i.test(ua)) os = "Linux";
+    else os = "Unknown";
+  }
+  return {
+    deviceName: String(b.deviceName || `${browser} / ${os}`).slice(0, 120),
+    deviceType: String(b.deviceType || (isTablet ? "tablet" : isMobile ? "mobile" : "desktop")),
+    os,
+    osVersion: b.osVersion ? String(b.osVersion).slice(0, 40) : undefined,
+    browser,
+    browserVersion: b.browserVersion ? String(b.browserVersion).slice(0, 40) : undefined,
+    userAgent: ua.slice(0, 500),
+  };
+}
+
+let settingsCache: { at: number; value: DeviceSecuritySettings } | null = null;
+
+export async function getDeviceSecuritySettings(): Promise<DeviceSecuritySettings> {
+  if (settingsCache && Date.now() - settingsCache.at < 15_000) return settingsCache.value;
+  const [row] = await db.select().from(deviceSecuritySettingsTable).where(eq(deviceSecuritySettingsTable.id, 1)).limit(1);
+  if (!row) {
+    try {
+      await db.insert(deviceSecuritySettingsTable).values({ id: 1 });
+    } catch {
+      /* race */
+    }
+    const [created] = await db.select().from(deviceSecuritySettingsTable).where(eq(deviceSecuritySettingsTable.id, 1)).limit(1);
+    const value = mapSettings(created!);
+    settingsCache = { at: Date.now(), value };
+    return value;
+  }
+  const value = mapSettings(row);
+  settingsCache = { at: Date.now(), value };
+  return value;
+}
+
+export function invalidateSettingsCache() {
+  settingsCache = null;
+}
+
+function mapSettings(row: typeof deviceSecuritySettingsTable.$inferSelect): DeviceSecuritySettings {
+  return {
+    id: row.id,
+    enforcementMode: (row.enforcementMode as EnforcementMode) || "selected",
+    officeMaxDevices: row.officeMaxDevices ?? 2,
+    pharmacyMaxDevices: row.pharmacyMaxDevices ?? 1,
+    officeRequireApprove: row.officeRequireApprove ?? true,
+    pharmacyRequireApprove: row.pharmacyRequireApprove ?? true,
+    officeBlockForeign: row.officeBlockForeign ?? true,
+    pharmacyBlockForeign: row.pharmacyBlockForeign ?? true,
+    officeVerifyQr: row.officeVerifyQr ?? true,
+    pharmacyVerifyQr: row.pharmacyVerifyQr ?? true,
+    officeVerifyFace: row.officeVerifyFace ?? true,
+    pharmacyVerifyFace: row.pharmacyVerifyFace ?? true,
+    logIpChanges: row.logIpChanges ?? true,
+    suspiciousNotify: row.suspiciousNotify ?? true,
+  };
+}
+
+export function policyForGroup(settings: DeviceSecuritySettings, group: StaffGroup) {
+  if (group === "pharmacy") {
+    return {
+      maxDevices: settings.pharmacyMaxDevices,
+      requireApprove: settings.pharmacyRequireApprove,
+      blockForeign: settings.pharmacyBlockForeign,
+      verifyQr: settings.pharmacyVerifyQr,
+      verifyFace: settings.pharmacyVerifyFace,
+    };
+  }
+  return {
+    maxDevices: settings.officeMaxDevices,
+    requireApprove: settings.officeRequireApprove,
+    blockForeign: settings.officeBlockForeign,
+    verifyQr: settings.officeVerifyQr,
+    verifyFace: settings.officeVerifyFace,
+  };
+}
+
+export async function isDeviceSecurityEnforced(user: {
+  id: number;
+  role: string;
+  deviceSecurityEnforced?: boolean | null;
+}): Promise<boolean> {
+  // TO‘LIQ RUXSAT REJIMI (platforma egasi talabi): barcha ofis va dorixona
+  // xodimlari istalgan joydan/qurilmadan faqat login+parol bilan kiradi.
+  // Qurilma nazorati standart holatda O‘CHIQ — faqat serverda
+  // DEVICE_SECURITY_ENABLED=1 ataylab qo‘yilsa yana ishlaydi.
+  if (process.env.DEVICE_SECURITY_ENABLED !== "1") return false;
+  if (isStudentRole(user.role)) return false;
+  const settings = await getDeviceSecuritySettings();
+  const mode = settings.enforcementMode;
+  if (mode === "off") return false;
+  // Admin "Majburiy" yoqqan xodim — rejimdan qat'i nazar (off dan tashqari)
+  if (user.deviceSecurityEnforced) return true;
+  if (mode === "all") return true;
+  if (mode === "selected") return false;
+  const group = staffGroupForRole(user.role);
+  if (mode === "office") return group === "office";
+  if (mode === "pharmacy") return group === "pharmacy";
+  return false;
+}
+
+/** Majburiy yoqilgan xodim: faqat 1 asosiy qurilma, begona blok */
+export function policyForUser(
+  settings: DeviceSecuritySettings,
+  user: { role: string; deviceSecurityEnforced?: boolean | null },
+) {
+  const base = policyForGroup(settings, staffGroupForRole(user.role));
+  if (user.deviceSecurityEnforced) {
+    return {
+      ...base,
+      maxDevices: 1,
+      blockForeign: true,
+      requireApprove: false,
+    };
+  }
+  return base;
+}
+
+export function readDeviceCookie(req: Request): { deviceId: string; token: string } | null {
+  const raw = req.cookies?.[DEVICE_COOKIE];
+  if (!raw || typeof raw !== "string") return null;
+  const parts = raw.split(".");
+  if (parts.length !== 2) return null;
+  const [deviceId, token] = parts;
+  if (!deviceId || !token) return null;
+  return { deviceId, token };
+}
+
+export type CookieSiteMode = "lax" | "telegram";
+
+function cookieSameSite(mode: CookieSiteMode = "lax"): "lax" | "none" {
+  // Telegram Mini App WebView — SameSite=None + Secure
+  if (mode === "telegram" && isProdEnv()) return "none";
+  return "lax";
+}
+
+export function setDeviceCookie(
+  res: Response,
+  deviceId: string,
+  token: string,
+  opts?: { siteMode?: CookieSiteMode },
+) {
+  const sameSite = cookieSameSite(opts?.siteMode);
+  res.cookie(DEVICE_COOKIE, `${deviceId}.${token}`, {
+    httpOnly: true,
+    maxAge: 400 * 24 * 60 * 60 * 1000,
+    sameSite,
+    secure: isProdEnv(),
+    path: "/",
+  });
+}
+
+export function clearDeviceCookie(res: Response) {
+  res.clearCookie(DEVICE_COOKIE, { path: "/", sameSite: "lax", secure: isProdEnv() });
+  if (isProdEnv()) {
+    res.clearCookie(DEVICE_COOKIE, { path: "/", sameSite: "none", secure: true });
+  }
+}
+
+export function setSecureSessionCookie(
+  res: Response,
+  sessionToken: string,
+  opts?: { siteMode?: CookieSiteMode },
+) {
+  const sameSite = cookieSameSite(opts?.siteMode);
+  res.cookie(SECURE_SESSION_COOKIE, `sec.${sessionToken}`, {
+    httpOnly: true,
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    sameSite,
+    secure: isProdEnv(),
+    path: "/",
+  });
+}
+
+export function parseSecureSessionCookie(raw?: string): string | null {
+  if (!raw || typeof raw !== "string") return null;
+  if (raw.startsWith("sec.")) return raw.slice(4);
+  return null;
+}
+
+/** Admin «ko‘zcha» — qurilma biriktirilmasdan ochilgan sessiya. */
+export function isAdminEnterSession(session: {
+  deviceRowId?: number | null;
+  userAgent?: string | null;
+}): boolean {
+  return session.deviceRowId == null && String(session.userAgent || "").startsWith("admin-enter:");
+}
+
+export function isLegacySessionCookie(raw?: string): boolean {
+  if (!raw) return false;
+  if (raw.startsWith("sec.")) return false;
+  try {
+    const decoded = JSON.parse(Buffer.from(raw, "base64").toString());
+    return Number.isFinite(decoded?.userId);
+  } catch {
+    return false;
+  }
+}
+
+export async function writeLoginAudit(opts: {
+  userId?: number | null;
+  deviceRowId?: number | null;
+  deviceId?: string | null;
+  ipAddress?: string | null;
+  userAgent?: string | null;
+  action: string;
+  status: string;
+  failureReason?: string | null;
+  meta?: Record<string, unknown>;
+}) {
+  try {
+    await db.insert(loginAuditLogsTable).values({
+      userId: opts.userId ?? null,
+      deviceRowId: opts.deviceRowId ?? null,
+      deviceId: opts.deviceId ?? null,
+      ipAddress: opts.ipAddress ?? null,
+      userAgent: opts.userAgent ?? null,
+      action: opts.action,
+      status: opts.status,
+      failureReason: opts.failureReason ?? null,
+      meta: opts.meta ?? null,
+    });
+  } catch (err) {
+    console.error("login_audit insert", err);
+  }
+}
+
+export async function writeSecurityEvent(opts: {
+  userId?: number | null;
+  deviceRowId?: number | null;
+  eventType: string;
+  severity?: string;
+  metadata?: Record<string, unknown>;
+}) {
+  try {
+    await db.insert(securityEventsTable).values({
+      userId: opts.userId ?? null,
+      deviceRowId: opts.deviceRowId ?? null,
+      eventType: opts.eventType,
+      severity: opts.severity || "medium",
+      metadata: opts.metadata ?? null,
+    });
+  } catch (err) {
+    console.error("security_event insert", err);
+  }
+}
+
+export async function createServerSession(opts: {
+  userId: number;
+  deviceRowId: number | null;
+  ipAddress?: string | null;
+  userAgent?: string | null;
+  res: Response;
+  /** Telegram Mini App — SameSite=None cookie */
+  siteMode?: CookieSiteMode;
+}) {
+  const token = randomToken(32);
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  await db.insert(userSessionsTable).values({
+    userId: opts.userId,
+    deviceRowId: opts.deviceRowId,
+    sessionTokenHash: sha256(token),
+    expiresAt,
+    ipAddress: opts.ipAddress ?? null,
+    userAgent: opts.userAgent ?? null,
+  });
+  setSecureSessionCookie(opts.res, token, { siteMode: opts.siteMode });
+  return token;
+}
+
+export async function revokeSessionsForUser(userId: number, deviceRowId?: number) {
+  const now = new Date();
+  if (deviceRowId != null) {
+    await db
+      .update(userSessionsTable)
+      .set({ revokedAt: now })
+      .where(
+        and(
+          eq(userSessionsTable.userId, userId),
+          eq(userSessionsTable.deviceRowId, deviceRowId),
+          isNull(userSessionsTable.revokedAt),
+        ),
+      );
+  } else {
+    await db
+      .update(userSessionsTable)
+      .set({ revokedAt: now })
+      .where(and(eq(userSessionsTable.userId, userId), isNull(userSessionsTable.revokedAt)));
+  }
+}
+
+export async function findDeviceByCred(userId: number, deviceId: string, token: string) {
+  const [row] = await db
+    .select()
+    .from(userDevicesTable)
+    .where(and(eq(userDevicesTable.userId, userId), eq(userDevicesTable.deviceId, deviceId)))
+    .limit(1);
+  if (!row) return null;
+  if (row.deviceTokenHash !== sha256(token)) return null;
+  return row;
+}
+
+export async function countVerifiedDevices(userId: number): Promise<number> {
+  const rows = await db
+    .select({ id: userDevicesTable.id })
+    .from(userDevicesTable)
+    .where(
+      and(
+        eq(userDevicesTable.userId, userId),
+        eq(userDevicesTable.isVerified, true),
+        eq(userDevicesTable.isBlocked, false),
+      ),
+    );
+  return rows.length;
+}
+
+export function parseDeviceBindRaw(raw?: string | null): { deviceId: string; token: string } | null {
+  if (!raw || typeof raw !== "string") return null;
+  const i = raw.indexOf(".");
+  if (i <= 0 || i >= raw.length - 1) return null;
+  const deviceId = raw.slice(0, i).trim();
+  const token = raw.slice(i + 1).trim();
+  if (!deviceId || !token) return null;
+  return { deviceId, token };
+}
+
+export async function findDeviceByClientKey(userId: number, clientKey: string) {
+  const key = clientKey.trim().slice(0, 120);
+  if (!key) return null;
+  const [row] = await db
+    .select()
+    .from(userDevicesTable)
+    .where(and(eq(userDevicesTable.userId, userId), eq(userDevicesTable.clientKey, key)))
+    .limit(1);
+  return row ?? null;
+}
+
+/** Tokenni yangilab cookie uchun qaytaradi */
+export async function refreshDeviceToken(deviceRowId: number): Promise<string> {
+  const token = randomToken(32);
+  await db
+    .update(userDevicesTable)
+    .set({ deviceTokenHash: sha256(token), lastSeenAt: new Date() })
+    .where(eq(userDevicesTable.id, deviceRowId));
+  return token;
+}
+
+export async function registerPendingDevice(opts: {
+  userId: number;
+  meta: DeviceMeta;
+  ip: string;
+  slot: string;
+  clientKey?: string | null;
+}): Promise<{ deviceId: string; token: string; rowId: number }> {
+  const clientKey = opts.clientKey?.trim().slice(0, 120) || null;
+  if (clientKey) {
+    const existing = await findDeviceByClientKey(opts.userId, clientKey);
+    if (existing) {
+      if (existing.isBlocked) {
+        await reopenDeviceForApproval(existing.id);
+      }
+      const token = await refreshDeviceToken(existing.id);
+      await db
+        .update(userDevicesTable)
+        .set({
+          deviceName: opts.meta.deviceName || existing.deviceName,
+          deviceType: opts.meta.deviceType || existing.deviceType,
+          os: opts.meta.os || existing.os,
+          browser: opts.meta.browser || existing.browser,
+          userAgent: opts.meta.userAgent || existing.userAgent,
+          lastIp: opts.ip,
+          lastSeenAt: new Date(),
+        })
+        .where(eq(userDevicesTable.id, existing.id));
+      return { deviceId: existing.deviceId, token, rowId: existing.id };
+    }
+  }
+
+  const deviceId = randomToken(18);
+  const token = randomToken(32);
+  const [row] = await db
+    .insert(userDevicesTable)
+    .values({
+      userId: opts.userId,
+      deviceId,
+      clientKey,
+      deviceTokenHash: sha256(token),
+      deviceName: opts.meta.deviceName,
+      deviceType: opts.meta.deviceType || "unknown",
+      slot: opts.slot,
+      os: opts.meta.os,
+      osVersion: opts.meta.osVersion,
+      browser: opts.meta.browser,
+      browserVersion: opts.meta.browserVersion,
+      userAgent: opts.meta.userAgent,
+      ipAddress: opts.ip,
+      lastIp: opts.ip,
+      isPrimary: false,
+      isVerified: false,
+      isBlocked: false,
+    })
+    .returning({ id: userDevicesTable.id });
+  return { deviceId, token, rowId: row!.id };
+}
+
+export async function approveDevice(deviceRowId: number, reviewedBy: number) {
+  const [device] = await db.select().from(userDevicesTable).where(eq(userDevicesTable.id, deviceRowId)).limit(1);
+  if (!device) return null;
+  const [user] = await db
+    .select({ id: usersTable.id, role: usersTable.role })
+    .from(usersTable)
+    .where(eq(usersTable.id, device.userId))
+    .limit(1);
+  if (!user) return null;
+
+  // Ruxsat = faqat shu qurilma asosiy; eski joylar yopiladi va bloklanadi
+  const others = await db
+    .select({ id: userDevicesTable.id })
+    .from(userDevicesTable)
+    .where(and(eq(userDevicesTable.userId, user.id), ne(userDevicesTable.id, deviceRowId)));
+
+  for (const old of others) {
+    await db
+      .update(userDevicesTable)
+      .set({
+        isVerified: false,
+        isPrimary: false,
+        isBlocked: true,
+        blockedAt: new Date(),
+        blockedBy: reviewedBy,
+      })
+      .where(eq(userDevicesTable.id, old.id));
+  }
+
+  // Barcha ochiq sessionlar yopiladi — faqat yangi asosiydan qayta kiradi
+  await revokeSessionsForUser(user.id);
+
+  await db
+    .update(userDevicesTable)
+    .set({
+      isVerified: true,
+      isBlocked: false,
+      blockedAt: null,
+      blockedBy: null,
+      isPrimary: true,
+      lastSeenAt: new Date(),
+      lastLoginAt: new Date(),
+    })
+    .where(eq(userDevicesTable.id, deviceRowId));
+
+  await db
+    .update(deviceChangeRequestsTable)
+    .set({ status: "approved", reviewedAt: new Date(), reviewedBy })
+    .where(
+      and(
+        eq(deviceChangeRequestsTable.newDeviceRowId, deviceRowId),
+        eq(deviceChangeRequestsTable.status, "pending"),
+      ),
+    );
+
+  // Boshqa pending so‘rovlar rad
+  await db
+    .update(deviceChangeRequestsTable)
+    .set({ status: "rejected", reviewedAt: new Date(), reviewedBy })
+    .where(
+      and(
+        eq(deviceChangeRequestsTable.userId, user.id),
+        eq(deviceChangeRequestsTable.status, "pending"),
+        ne(deviceChangeRequestsTable.newDeviceRowId, deviceRowId),
+      ),
+    );
+
+  return device;
+}
+
+/** Hozirgi asosiy (tasdiqlangan) qurilma */
+export async function getPrimaryDeviceInfo(userId: number): Promise<{
+  id: number;
+  deviceName: string | null;
+  lastLoginAt: string | null;
+} | null> {
+  const [primary] = await db
+    .select({
+      id: userDevicesTable.id,
+      deviceName: userDevicesTable.deviceName,
+      lastLoginAt: userDevicesTable.lastLoginAt,
+    })
+    .from(userDevicesTable)
+    .where(
+      and(
+        eq(userDevicesTable.userId, userId),
+        eq(userDevicesTable.isVerified, true),
+        eq(userDevicesTable.isBlocked, false),
+        eq(userDevicesTable.isPrimary, true),
+      ),
+    )
+    .limit(1);
+  if (!primary) return null;
+  return {
+    id: primary.id,
+    deviceName: primary.deviceName ?? null,
+    lastLoginAt: primary.lastLoginAt ? primary.lastLoginAt.toISOString() : null,
+  };
+}
+
+/** Oxirgi marta admin qachon ruxsat bergani (so‘rov yuborganlarga ko‘rsatish uchun) */
+export async function getLastDeviceApproval(userId: number): Promise<{
+  at: string;
+  deviceName: string | null;
+  status: "approved";
+} | null> {
+  const [row] = await db
+    .select({
+      reviewedAt: deviceChangeRequestsTable.reviewedAt,
+      deviceName: userDevicesTable.deviceName,
+    })
+    .from(deviceChangeRequestsTable)
+    .leftJoin(
+      userDevicesTable,
+      eq(userDevicesTable.id, deviceChangeRequestsTable.newDeviceRowId),
+    )
+    .where(
+      and(
+        eq(deviceChangeRequestsTable.userId, userId),
+        eq(deviceChangeRequestsTable.status, "approved"),
+      ),
+    )
+    .orderBy(desc(deviceChangeRequestsTable.reviewedAt))
+    .limit(1);
+
+  if (row?.reviewedAt) {
+    return {
+      at: row.reviewedAt.toISOString(),
+      deviceName: row.deviceName ?? null,
+      status: "approved",
+    };
+  }
+
+  // So‘rov yozuvi yo‘q bo‘lsa — hozirgi asosiy qurilma birinchi tasdiq vaqti
+  const [primary] = await db
+    .select({
+      lastLoginAt: userDevicesTable.lastLoginAt,
+      firstSeenAt: userDevicesTable.firstSeenAt,
+      updatedAt: userDevicesTable.updatedAt,
+      deviceName: userDevicesTable.deviceName,
+    })
+    .from(userDevicesTable)
+    .where(
+      and(
+        eq(userDevicesTable.userId, userId),
+        eq(userDevicesTable.isVerified, true),
+        eq(userDevicesTable.isBlocked, false),
+        eq(userDevicesTable.isPrimary, true),
+      ),
+    )
+    .limit(1);
+
+  if (!primary) return null;
+  const at = primary.updatedAt || primary.lastLoginAt || primary.firstSeenAt;
+  if (!at) return null;
+  return {
+    at: at.toISOString(),
+    deviceName: primary.deviceName ?? null,
+    status: "approved",
+  };
+}
+
+/** Pending qurilma uchun almashtirish so‘rovi (mavjud bo‘lsa qayta yaratmaydi) */
+export async function ensureDeviceChangeRequest(opts: {
+  userId: number;
+  newDeviceRowId: number;
+  reason?: string | null;
+}): Promise<{ created: boolean; requestId?: number }> {
+  const [existing] = await db
+    .select({ id: deviceChangeRequestsTable.id })
+    .from(deviceChangeRequestsTable)
+    .where(
+      and(
+        eq(deviceChangeRequestsTable.newDeviceRowId, opts.newDeviceRowId),
+        eq(deviceChangeRequestsTable.status, "pending"),
+      ),
+    )
+    .limit(1);
+  if (existing) return { created: false, requestId: existing.id };
+
+  const [oldPrimary] = await db
+    .select({ id: userDevicesTable.id })
+    .from(userDevicesTable)
+    .where(
+      and(
+        eq(userDevicesTable.userId, opts.userId),
+        eq(userDevicesTable.isPrimary, true),
+        eq(userDevicesTable.isVerified, true),
+      ),
+    )
+    .limit(1);
+
+  const [row] = await db
+    .insert(deviceChangeRequestsTable)
+    .values({
+      userId: opts.userId,
+      oldDeviceRowId: oldPrimary?.id ?? null,
+      newDeviceRowId: opts.newDeviceRowId,
+      status: "pending",
+      reason: opts.reason?.slice(0, 500) || null,
+    })
+    .returning({ id: deviceChangeRequestsTable.id });
+  return { created: true, requestId: row?.id };
+}
+
+/** Bloklangan qurilmani qayta «tasdiq kutilmoqda» holatiga qaytaradi */
+export async function reopenDeviceForApproval(deviceRowId: number) {
+  await db
+    .update(userDevicesTable)
+    .set({
+      isBlocked: false,
+      isVerified: false,
+      isPrimary: false,
+      blockedAt: null,
+      blockedBy: null,
+      lastSeenAt: new Date(),
+    })
+    .where(eq(userDevicesTable.id, deviceRowId));
+}
+
+export async function touchDevice(deviceRowId: number, ip?: string) {
+  await db
+    .update(userDevicesTable)
+    .set({
+      lastSeenAt: new Date(),
+      ...(ip ? { lastIp: ip } : {}),
+    })
+    .where(eq(userDevicesTable.id, deviceRowId));
+}
+
+export async function touchSession(sessionId: number) {
+  await db
+    .update(userSessionsTable)
+    .set({ lastActivityAt: new Date() })
+    .where(eq(userSessionsTable.id, sessionId));
+}
+
+export type DeviceAuthContext = {
+  enforced: boolean;
+  deviceRowId?: number;
+  sessionId?: number;
+  deviceStatus?: "ok" | "pending" | "blocked" | "foreign";
+};
+
+export { usersTable, userDevicesTable, userSessionsTable, deviceChangeRequestsTable, securityEventsTable, loginAuditLogsTable, deviceSecuritySettingsTable };
