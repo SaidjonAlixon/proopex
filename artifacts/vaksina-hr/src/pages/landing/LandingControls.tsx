@@ -31,7 +31,7 @@ export function LandingTheme({ className }: { className?: string }) {
   const { resolvedTheme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
-  const isDark = mounted ? resolvedTheme === 'dark' : true;
+  const isDark = mounted ? resolvedTheme === 'dark' : false;
 
   return (
     <button

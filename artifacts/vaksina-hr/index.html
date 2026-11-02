@@ -29,8 +29,9 @@
         try {
           var key = 'vaksina-hr-theme';
           var stored = localStorage.getItem(key);
-          var theme = stored === 'light' || stored === 'dark' ? stored : 'dark';
+          var theme = stored === 'light' || stored === 'dark' ? stored : 'light';
           if (theme === 'dark') document.documentElement.classList.add('dark');
+          else document.documentElement.classList.remove('dark');
         } catch (e) {}
       })();
     </script>
