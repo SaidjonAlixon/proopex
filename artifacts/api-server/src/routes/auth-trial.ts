@@ -62,13 +62,13 @@ async function getUserWithDept(userId: number) {
   return user ?? null;
 }
 
-/** Telegram Login Widget — akkauntni ulash (@vaksinahrbot ishlatilmaydi) */
+/** Telegram Login Widget — akkauntni ulash (faqat PROOPEX boti) */
 router.post("/auth/trial/telegram/link", async (req, res): Promise<void> => {
   try {
     const botUsername = await resolveProopexBotUsername();
     if (!isTelegramConfigured() || !botUsername) {
       res.status(503).json({
-        error: "Telegram PROOPEX boti sozlanmagan. @vaksinahrbot bu platformada ishlatilmaydi.",
+        error: "Telegram PROOPEX boti sozlanmagan.",
       });
       return;
     }
@@ -121,7 +121,7 @@ router.post("/auth/trial/telegram/start", async (_req, res): Promise<void> => {
     const botUsername = await resolveProopexBotUsername();
     if (!isTelegramConfigured() || !botUsername || isForbiddenTelegramBot(botUsername)) {
       res.status(503).json({
-        error: "Telegram PROOPEX boti sozlanmagan. @vaksinahrbot ishlatilmaydi.",
+        error: "Telegram PROOPEX boti sozlanmagan.",
       });
       return;
     }
@@ -510,7 +510,7 @@ router.post("/auth/trial/complete", async (req, res): Promise<void> => {
   }
 });
 
-/** Google / Telegram (frontend) — @vaksinahrbot hech qachon berilmaydi */
+/** Google / Telegram (frontend) */
 router.get("/auth/trial/config", async (_req, res): Promise<void> => {
   const googleClientId = String(process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || "").trim();
   const botUsername = await resolveProopexBotUsername();

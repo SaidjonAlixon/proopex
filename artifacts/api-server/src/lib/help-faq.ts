@@ -139,9 +139,9 @@ export const HELP_FAQS: HelpFaq[] = [
     titleRu: "Telegram",
     keywords: ["telegram", "bot", "mini app", "tg", "kirish", "вход"],
     answerUz:
-      "Tizimga rasmiy sayt orqali kiring: proopex.uz — login va parol bilan.\n@vaksinahrbot bu platformada ishlatilmaydi.",
+      "Tizimga rasmiy sayt orqali kiring: proopex.uz — login va parol bilan.",
     answerRu:
-      "Входите через официальный сайт: proopex.uz — логин и пароль.\n@vaksinahrbot на этой платформе не используется.",
+      "Входите через официальный сайт: proopex.uz — логин и пароль.",
     links: [
       {
         label: "proopex.uz",

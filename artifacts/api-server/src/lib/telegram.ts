@@ -90,7 +90,7 @@ function botToken(): string | null {
   return t || null;
 }
 
-/** PROOPEX da ishlatilmaydigan (boshqa loyiha) botlar */
+/** Boshqa loyiha botlari — PROOPEX da ulanmaydi */
 export function isForbiddenTelegramBot(username?: string | null): boolean {
   const u = String(username || "")
     .trim()
@@ -306,7 +306,7 @@ export async function getMe() {
   return tgCall<{ id: number; username?: string; first_name?: string }>("getMe", {});
 }
 
-/** PROOPEX uchun bot username — @vaksinahrbot hech qachon qaytmaydi */
+/** PROOPEX uchun bot username (taqiqlangan botlar null) */
 export async function resolveProopexBotUsername(): Promise<string | null> {
   const fromEnv = String(process.env.TELEGRAM_BOT_USERNAME || "")
     .trim()

@@ -100,8 +100,8 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
         .trim()
         .replace(/^@/, '')
         .toLowerCase();
-      // @vaksinahrbot PROOPEX da umuman ishlatilmaydi
-      const okBot = Boolean(c.telegramConfigured && raw && raw !== 'vaksinahrbot');
+      const blocked = raw === 'vaksinahrbot';
+      const okBot = Boolean(c.telegramConfigured && raw && !blocked);
       setBotUsername(okBot ? raw : null);
       setTelegramReady(okBot);
     });
@@ -127,7 +127,7 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
     [toast],
   );
 
-  /** Rasmiy Telegram Login Widget — faqat PROOPEX boti (vaksinahrbot emas) */
+  /** Rasmiy Telegram Login Widget — faqat PROOPEX boti */
   useEffect(() => {
     if (step !== 'method' || !telegramReady || !botUsername) return;
     const host = tgWidgetRef.current;

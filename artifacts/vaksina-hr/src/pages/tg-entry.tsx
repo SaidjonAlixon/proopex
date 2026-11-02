@@ -349,7 +349,6 @@ export default function TgEntryPage() {
   };
 
   const openBotForNewToken = () => {
-    // @vaksinahrbot PROOPEX da ishlatilmaydi — saytga yo‘naltiramiz
     window.open("https://proopex.uz/login", "_blank");
   };
 

@@ -1,5 +1,5 @@
 /**
- * Yordamchi AI — PROOPEX Telegram boti orqali suhbat (@vaksinahrbot ishlatilmaydi).
+ * Yordamchi AI — PROOPEX Telegram boti orqali suhbat.
  *
  * Qoidalar (egasi talabi):
  *  - XODIMLAR: AI (OpenAI) UMUMAN ishlatilmaydi — javob faqat bazadan, kod bilan tayyorlanadi:

@@ -1,6 +1,5 @@
 /**
- * Telegram guruh/shaxsiy chat yordam javoblari.
- * @vaksinahrbot PROOPEX da ishlatilmaydi.
+ * Telegram guruh/shaxsiy chat yordam javoblari (faqat PROOPEX boti).
  */
 import { faqAnswer, matchHelpFaq } from "./help-faq";
 import { logger } from "./logger";
@@ -168,7 +167,6 @@ const CREDENTIAL_LEAK_RE =
 const TWO_WAYS = [
   `🌐 Platformaga <b>${SITE_LABEL}</b> orqali kiring:`,
   `Telefon brauzerida (iPhone: Safari, Android: Chrome) oching, login va parolingizni kiriting.`,
-  `@vaksinahrbot bu platformada ishlatilmaydi.`,
 ].join("\n");
 
 const COORDINATOR_NOTE =
@@ -227,7 +225,7 @@ const ANSWERS = {
     compose(
       [
         "🔐 <b>Kirish yoki ishlashda muammo bo‘lsa, tekshiring:</b>",
-        `1) Faqat <b>${SITE_LABEL}</b> orqali kiryapsizmi (boshqa bot/ilova yo‘q; @vaksinahrbot ishlatilmaydi).`,
+        `1) Faqat <b>${SITE_LABEL}</b> orqali kiryapsizmi (boshqa bot/ilova yo‘q).`,
         "2) Login va parol lotin harflarida, bo‘sh joysiz, katta-kichik harflari to‘g‘ri yozilganmi.",
         "3) Internet ishlayaptimi — sahifani yangilang yoki brauzerni yopib qayta oching (iPhone: Safari, Android: Chrome).",
         "4) Botdagi havola eskirgan bo‘lsa — /kirish yoki «🔄 Yangi kirish havolasi».",

@@ -642,7 +642,7 @@ async function handleUpdate(update: TelegramUpdate) {
     });
     if (gated) return;
     const gText = (msg.text ?? msg.caption ?? "").toLowerCase();
-    // @vaksinahrbot — PROOPEX da javob berilmaydi / ishlatilmaydi
+    // Taqiqlangan (boshqa loyiha) bot — e'tiborsiz
     if (gText.includes("@vaksinahrbot") || msg.reply_to_message?.from?.username === "vaksinahrbot") {
       return;
     }
