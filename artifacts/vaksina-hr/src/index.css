@@ -10274,6 +10274,26 @@ button.landing-footer-link {
   width: 1.85rem;
   height: 1.85rem;
 }
+.trial-tg-widget-wrap {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 2.75rem;
+  padding: 0.35rem 0.25rem;
+  border-radius: 0.9rem;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(34, 158, 217, 0.22);
+}
+.dark .trial-tg-widget-wrap {
+  background: rgba(2, 6, 23, 0.35);
+  border-color: rgba(56, 189, 248, 0.25);
+}
+.trial-tg-widget {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  min-height: 40px;
+}
 .trial-phone-card {
   display: grid;
   gap: 0.75rem;

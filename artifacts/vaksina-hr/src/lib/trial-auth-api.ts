@@ -45,33 +45,25 @@ export function startPhoneTrial(phone: string) {
   }>('/auth/trial/phone/start', { phone });
 }
 
-export function startTelegramTrial() {
+export type TelegramLoginPayload = {
+  id: number;
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+  photo_url?: string;
+  auth_date: number;
+  hash: string;
+};
+
+/** Telegram Login Widget — akkaunt ulash */
+export function linkTelegramTrial(auth: TelegramLoginPayload) {
   return postJson<{
     challengeId: string;
-    botUsername: string;
-    botUrl: string;
-    message: string;
-  }>('/auth/trial/telegram/start', {});
-}
-
-export async function pollTelegramTrial(challengeId: string) {
-  const res = await fetch(
-    `/api/auth/trial/telegram/status?challengeId=${encodeURIComponent(challengeId)}`,
-    { credentials: 'include' },
-  );
-  const data = (await res.json().catch(() => ({}))) as {
-    challengeId?: string;
-    verified?: boolean;
-    pending?: boolean;
-    targetMasked?: string;
+    verified: boolean;
+    targetMasked: string;
     fullName?: string | null;
-    message?: string;
-    error?: string;
-  };
-  if (!res.ok) {
-    throw new Error(data.error || data.message || 'Telegram holati o‘qilmadi');
-  }
-  return data;
+    message: string;
+  }>('/auth/trial/telegram/link', auth as unknown as Record<string, unknown>);
 }
 
 export function startGoogleTrial(opts: { idToken?: string; accessToken?: string; email?: string }) {

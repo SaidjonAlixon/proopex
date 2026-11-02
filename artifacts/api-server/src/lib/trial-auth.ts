@@ -96,7 +96,7 @@ export function createPhoneChallenge(phone: string, code: string) {
   return id;
 }
 
-/** Telegram bot deep-link: saytda challenge yaratiladi, botda /start trial_<token> bilan tasdiqlanadi */
+/** Telegram bot deep-link (eski) — saytda challenge, botda /start */
 export function createTelegramChallenge() {
   pruneExpired();
   const id = newId();
@@ -113,6 +113,31 @@ export function createTelegramChallenge() {
   });
   telegramStartIndex.set(startToken, id);
   return { id, startToken };
+}
+
+/** Telegram Login Widget — akkaunt ulangan, darhol tasdiqlangan challenge */
+export function createTelegramVerifiedChallenge(tg: {
+  id: number | string;
+  username?: string;
+  firstName?: string;
+  lastName?: string;
+}) {
+  pruneExpired();
+  const id = newId();
+  const tgId = String(tg.id || "").trim();
+  const name = [tg.firstName, tg.lastName].filter(Boolean).join(" ").trim();
+  challenges.set(id, {
+    id,
+    method: "telegram",
+    target: tgId,
+    codeHash: hashCode(tgId),
+    verified: true,
+    telegramUsername: tg.username ? String(tg.username).replace(/^@/, "") : undefined,
+    telegramName: name || undefined,
+    expiresAt: Date.now() + CODE_TTL_MS,
+    attempts: 0,
+  });
+  return id;
 }
 
 export function confirmTelegramChallenge(

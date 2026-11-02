@@ -8,6 +8,7 @@ import {
   createGoogleEmailChallenge,
   createPhoneChallenge,
   createTelegramChallenge,
+  createTelegramVerifiedChallenge,
   findUserByTrialTarget,
   formatUzPhoneDisplay,
   getChallenge,
@@ -31,7 +32,7 @@ import {
   sendEskizSms,
 } from "../lib/eskiz-sms";
 import { sendTrialVerifyEmail } from "../lib/trial-email";
-import { getMe, isTelegramConfigured } from "../lib/telegram";
+import { getMe, isTelegramConfigured, verifyTelegramLoginWidget } from "../lib/telegram";
 
 const router: IRouter = Router();
 
@@ -56,7 +57,57 @@ async function getUserWithDept(userId: number) {
   return user ?? null;
 }
 
-/** Telegram bot deep-link — ro‘yxatdan o‘tish */
+/** Telegram Login Widget — akkauntni ulash */
+router.post("/auth/trial/telegram/link", async (req, res): Promise<void> => {
+  try {
+    if (!isTelegramConfigured()) {
+      res.status(503).json({ error: "Telegram sozlanmagan — admin TELEGRAM_BOT_TOKEN qo‘ysin" });
+      return;
+    }
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const verified = verifyTelegramLoginWidget({
+      id: body.id,
+      first_name: body.first_name,
+      last_name: body.last_name,
+      username: body.username,
+      photo_url: body.photo_url,
+      auth_date: body.auth_date,
+      hash: body.hash,
+    });
+    if (!verified.ok) {
+      res.status(400).json({ error: verified.error });
+      return;
+    }
+
+    const existing = await findUserByTrialTarget("telegram", String(verified.user.id));
+    if (existing) {
+      res.status(409).json({ error: "Bu Telegram allaqachon ro‘yxatdan o‘tgan — Kirishga o‘ting" });
+      return;
+    }
+
+    const challengeId = createTelegramVerifiedChallenge({
+      id: verified.user.id,
+      username: verified.user.username,
+      firstName: verified.user.firstName,
+      lastName: verified.user.lastName,
+    });
+    const challenge = getChallenge(challengeId)!;
+    res.json({
+      challengeId,
+      method: "telegram",
+      verified: true,
+      targetMasked: maskTelegramTarget(challenge),
+      fullName: challenge.telegramName || null,
+      message: "Telegram ulandi — parol o‘rnating",
+    });
+  } catch (err) {
+    console.error("[trial-tg] link:", err);
+    res.status(503).json({ error: "Telegram ulanmadi — qayta urinib ko‘ring" });
+  }
+});
+
+/** Eski deep-link start (moslik uchun) */
 router.post("/auth/trial/telegram/start", async (_req, res): Promise<void> => {
   try {
     if (!isTelegramConfigured()) {
@@ -82,7 +133,7 @@ router.post("/auth/trial/telegram/start", async (_req, res): Promise<void> => {
       botUsername: `@${botUsername}`,
       botUrl,
       expiresInSec: 600,
-      message: "Telegramda Start bosing — keyin saytda parol o‘rnating",
+      message: "Telegram akkauntingizni ulang",
     });
   } catch (err) {
     console.error("[trial-tg] start:", err);
@@ -90,7 +141,7 @@ router.post("/auth/trial/telegram/start", async (_req, res): Promise<void> => {
   }
 });
 
-/** Telegram tasdiq holati (frontend poll) */
+/** Telegram tasdiq holati (eski poll) */
 router.get("/auth/trial/telegram/status", async (req, res): Promise<void> => {
   const challengeId = String(req.query?.challengeId || "").trim();
   if (!challengeId) {
@@ -107,7 +158,7 @@ router.get("/auth/trial/telegram/status", async (req, res): Promise<void> => {
       challengeId,
       verified: false,
       pending: true,
-      message: "Telegramda Start tugmasini bosing",
+      message: "Telegram akkauntingizni ulang",
     });
     return;
   }

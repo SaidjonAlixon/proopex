@@ -338,6 +338,60 @@ export function verifyWebhookSecret(header: string | undefined): boolean {
   return header === secret;
 }
 
+/**
+ * Telegram Login Widget (saytda «akkauntni ulash»).
+ * https://core.telegram.org/widgets/login#checking-authorization
+ */
+export function verifyTelegramLoginWidget(data: Record<string, unknown>): {
+  ok: true;
+  user: {
+    id: number;
+    firstName?: string;
+    lastName?: string;
+    username?: string;
+    photoUrl?: string;
+  };
+} | { ok: false; error: string } {
+  const token = botToken();
+  if (!token) return { ok: false, error: "Telegram bot sozlanmagan" };
+
+  const hash = String(data.hash || "").trim();
+  if (!hash) return { ok: false, error: "Telegram imzo yo‘q" };
+
+  const id = Number(data.id);
+  if (!Number.isFinite(id) || id <= 0) return { ok: false, error: "Telegram foydalanuvchi topilmadi" };
+
+  const authDate = Number(data.auth_date || 0);
+  if (!authDate || Date.now() / 1000 - authDate > 24 * 60 * 60) {
+    return { ok: false, error: "Telegram sessiyasi eskirgan — qayta ulang" };
+  }
+
+  const entries: [string, string][] = [];
+  for (const [key, value] of Object.entries(data)) {
+    if (key === "hash" || value == null || value === "") continue;
+    entries.push([key, String(value)]);
+  }
+  entries.sort(([a], [b]) => a.localeCompare(b));
+  const dataCheckString = entries.map(([k, v]) => `${k}=${v}`).join("\n");
+
+  const secretKey = crypto.createHash("sha256").update(token).digest();
+  const calculatedHash = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
+  if (calculatedHash !== hash) {
+    return { ok: false, error: "Telegram imzo yaroqsiz" };
+  }
+
+  return {
+    ok: true,
+    user: {
+      id,
+      firstName: data.first_name ? String(data.first_name) : undefined,
+      lastName: data.last_name ? String(data.last_name) : undefined,
+      username: data.username ? String(data.username).replace(/^@/, "") : undefined,
+      photoUrl: data.photo_url ? String(data.photo_url) : undefined,
+    },
+  };
+}
+
 /** Telegram Mini App initData — WebApp ochilganda doimiy kirish */
 export function verifyTelegramInitData(initData: string): {
   user: TelegramUser;

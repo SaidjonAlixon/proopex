@@ -7,11 +7,11 @@ import { useToast } from '../../hooks/use-toast';
 import {
   completeTrial,
   fetchTrialConfig,
-  pollTelegramTrial,
+  linkTelegramTrial,
   startGoogleTrial,
-  startTelegramTrial,
   verifyTrialCode,
   verifyTrialLink,
+  type TelegramLoginPayload,
   type TrialMethod,
 } from '../../lib/trial-auth-api';
 import { cn } from '../../lib/utils';
@@ -27,6 +27,7 @@ type GoogleTokenClient = {
 
 declare global {
   interface Window {
+    onTelegramAuth?: (user: TelegramLoginPayload) => void;
     google?: {
       accounts: {
         id: {
@@ -67,7 +68,7 @@ function loadGoogleScript(): Promise<void> {
   });
 }
 
-type Step = 'method' | 'telegram' | 'otp' | 'password';
+type Step = 'method' | 'otp' | 'password';
 
 export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: TrialUser) => void }) {
   const { toast } = useToast();
@@ -79,8 +80,8 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
   const [verifyLink, setVerifyLink] = useState<string | null>(null);
   const [emailSent, setEmailSent] = useState(false);
   const [targetMasked, setTargetMasked] = useState('');
-  const [botUrl, setBotUrl] = useState<string | null>(null);
-  const [botUsername, setBotUsername] = useState('@vaksinahrbot');
+  const [botUsername, setBotUsername] = useState('vaksinahrbot');
+  const [telegramReady, setTelegramReady] = useState(true);
   const [fullName, setFullName] = useState('');
   const [password, setPassword] = useState('');
   const [password2, setPassword2] = useState('');
@@ -89,24 +90,73 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
   const [googleClientId, setGoogleClientId] = useState<string | null>(null);
   const tokenClientRef = useRef<GoogleTokenClient | null>(null);
   const linkHandledRef = useRef(false);
-  const pollStopRef = useRef(false);
+  const tgWidgetRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const fromVite = String(import.meta.env.VITE_GOOGLE_CLIENT_ID || '').trim();
     void fetchTrialConfig().then((c) => {
       setGoogleClientId(c.googleClientId || fromVite || null);
-      if (c.botUsername) setBotUsername(c.botUsername);
+      if (c.botUsername) setBotUsername(c.botUsername.replace(/^@/, ''));
+      setTelegramReady(c.telegramConfigured !== false);
     });
   }, []);
 
-  /** Gmail havolasi: ?verify=token yoki server redirect ?verified=challengeId; Telegram: ?tg= */
+  const finishTelegramLink = useCallback(
+    async (user: TelegramLoginPayload) => {
+      setMethod('telegram');
+      setPending(true);
+      try {
+        const res = await linkTelegramTrial(user);
+        setChallengeId(res.challengeId);
+        setTargetMasked(res.targetMasked);
+        if (res.fullName) setFullName(res.fullName);
+        setStep('password');
+        toast({ title: 'Telegram ulandi', description: res.message });
+      } catch (err) {
+        toast({ title: 'Telegram', description: (err as Error).message, variant: 'destructive' });
+      } finally {
+        setPending(false);
+      }
+    },
+    [toast],
+  );
+
+  /** Rasmiy Telegram Login Widget — akkauntni ulash oynasi */
+  useEffect(() => {
+    if (step !== 'method') return;
+    const host = tgWidgetRef.current;
+    if (!host) return;
+
+    window.onTelegramAuth = (user) => {
+      void finishTelegramLink(user);
+    };
+
+    host.innerHTML = '';
+    const script = document.createElement('script');
+    script.async = true;
+    script.src = 'https://telegram.org/js/telegram-widget.js?22';
+    script.setAttribute('data-telegram-login', botUsername.replace(/^@/, ''));
+    script.setAttribute('data-size', 'large');
+    script.setAttribute('data-radius', '12');
+    script.setAttribute('data-request-access', 'write');
+    script.setAttribute('data-userpic', 'false');
+    script.setAttribute('data-lang', 'uz');
+    script.setAttribute('data-onauth', 'onTelegramAuth(user)');
+    host.appendChild(script);
+
+    return () => {
+      if (window.onTelegramAuth) delete window.onTelegramAuth;
+      host.innerHTML = '';
+    };
+  }, [step, botUsername, finishTelegramLink]);
+
+  /** Gmail havolasi: ?verify=token yoki server redirect ?verified=challengeId */
   useEffect(() => {
     if (linkHandledRef.current) return;
     const params = new URLSearchParams(window.location.search);
     const token = params.get('verify');
     const verifiedId = params.get('verified');
     const verifyError = params.get('verifyError');
-    const tgChallenge = params.get('tg');
     if (verifyError) {
       linkHandledRef.current = true;
       toast({
@@ -114,29 +164,6 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
         description: 'Havola muddati tugagan yoki yaroqsiz — qayta Google orqali kiring',
         variant: 'destructive',
       });
-      return;
-    }
-    if (tgChallenge) {
-      linkHandledRef.current = true;
-      setChallengeId(tgChallenge);
-      setMethod('telegram');
-      setPending(true);
-      void pollTelegramTrial(tgChallenge)
-        .then((res) => {
-          if (res.verified) {
-            setTargetMasked(res.targetMasked || 'Telegram');
-            if (res.fullName) setFullName(res.fullName);
-            setStep('password');
-            toast({ title: 'Tasdiqlandi', description: 'Telegram — endi parol o‘rnating' });
-          } else {
-            setStep('telegram');
-          }
-        })
-        .catch((err) => {
-          toast({ title: 'Telegram', description: (err as Error).message, variant: 'destructive' });
-          setStep('method');
-        })
-        .finally(() => setPending(false));
       return;
     }
     if (verifiedId) {
@@ -290,66 +317,6 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
       .finally(() => setPending(false));
   };
 
-  const beginTelegram = async () => {
-    setMethod('telegram');
-    setPending(true);
-    pollStopRef.current = false;
-    try {
-      const res = await startTelegramTrial();
-      setChallengeId(res.challengeId);
-      setBotUrl(res.botUrl);
-      setBotUsername(res.botUsername || botUsername);
-      setStep('telegram');
-      window.open(res.botUrl, '_blank', 'noopener,noreferrer');
-      toast({ title: 'Telegram', description: res.message });
-    } catch (err) {
-      toast({ title: 'Telegram', description: (err as Error).message, variant: 'destructive' });
-      setStep('method');
-    } finally {
-      setPending(false);
-    }
-  };
-
-  useEffect(() => {
-    if (step !== 'telegram' || !challengeId || method !== 'telegram') return;
-    pollStopRef.current = false;
-    let ticks = 0;
-    const tick = async () => {
-      if (pollStopRef.current) return;
-      ticks += 1;
-      if (ticks > 90) {
-        toast({
-          title: 'Vaqt tugadi',
-          description: 'Telegramda Start bosing yoki qayta urinib ko‘ring',
-          variant: 'destructive',
-        });
-        return;
-      }
-      try {
-        const res = await pollTelegramTrial(challengeId);
-        if (res.verified) {
-          pollStopRef.current = true;
-          setTargetMasked(res.targetMasked || 'Telegram');
-          if (res.fullName) setFullName(res.fullName);
-          setStep('password');
-          toast({ title: 'Tasdiqlandi', description: 'Endi parol o‘rnating' });
-          return;
-        }
-      } catch (err) {
-        pollStopRef.current = true;
-        toast({ title: 'Telegram', description: (err as Error).message, variant: 'destructive' });
-        setStep('method');
-        return;
-      }
-      window.setTimeout(() => void tick(), 2000);
-    };
-    const t = window.setTimeout(() => void tick(), 1500);
-    return () => {
-      pollStopRef.current = true;
-      window.clearTimeout(t);
-    };
-  }, [step, challengeId, method, toast]);
-
   const confirmOtp = async () => {
     if (otp.trim().length < 4) {
       toast({ title: 'Kod', description: 'Tasdiqlash kodini kiriting', variant: 'destructive' });
@@ -414,64 +381,28 @@ export function TrialRegisterPanel({ onRegistered }: { onRegistered: (user: Tria
             <div className="trial-tg-card-head">
               <TelegramGlyph className="trial-tg-ico trial-tg-ico--lg" />
               <div>
-                <div className="trial-tg-card-title">Telegram orqali</div>
-                <div className="trial-tg-card-hint">Botda Start — akkaunt tasdiqlanadi</div>
+                <div className="trial-tg-card-title">Telegram akkauntini ulash</div>
+                <div className="trial-tg-card-hint">Botga o‘tmasdan — Telegram orqali tasdiqlang</div>
               </div>
             </div>
             <p className="trial-tg-help">
-              {botUsername} ochiladi. Start bosing, keyin saytda parol o‘rnating.
+              «Log in with Telegram» tugmasini bosing, akkauntingizni tanlang, keyin saytda parol o‘rnating.
             </p>
-            <Button
-              type="button"
-              className="login-proopex-submit w-full"
-              disabled={pending}
-              onClick={() => void beginTelegram()}
-            >
-              {pending && method === 'telegram' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-              Telegram orqali ro‘yxatdan o‘tish
-            </Button>
-          </div>
-        </div>
-      ) : null}
-
-      {step === 'telegram' ? (
-        <div className="trial-auth-stack">
-          <div className="trial-tg-card">
-            <div className="trial-tg-card-head">
-              <TelegramGlyph className="trial-tg-ico trial-tg-ico--lg" />
-              <div>
-                <div className="trial-tg-card-title">Telegramni tasdiqlang</div>
-                <div className="trial-tg-card-hint">Botda Start tugmasini bosing</div>
-              </div>
+            {!telegramReady ? (
+              <p className="text-xs font-semibold text-amber-700 dark:text-amber-300">
+                Telegram serverda sozlanmagan (TELEGRAM_BOT_TOKEN).
+              </p>
+            ) : null}
+            <div className="trial-tg-widget-wrap" aria-busy={pending}>
+              {pending ? (
+                <div className="flex items-center justify-center gap-2 py-3 text-sm text-sky-800 dark:text-sky-100">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Telegram ulanmoqda…
+                </div>
+              ) : (
+                <div ref={tgWidgetRef} className="trial-tg-widget" />
+              )}
             </div>
-            <div className="flex items-center gap-2 rounded-xl border border-sky-200/80 bg-sky-50/90 px-3 py-2.5 text-sm text-sky-950 dark:border-sky-500/30 dark:bg-sky-950/40 dark:text-sky-100">
-              <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
-              <span>Telegram javobini kutmoqdamiz…</span>
-            </div>
-            <p className="trial-tg-help">
-              Agar oyna ochilmasa, quyidagi tugma bilan {botUsername} ga o‘ting.
-            </p>
-          </div>
-          <div className="flex gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              className="flex-1"
-              onClick={() => {
-                pollStopRef.current = true;
-                setStep('method');
-              }}
-            >
-              Orqaga
-            </Button>
-            <Button
-              type="button"
-              className="login-proopex-submit flex-1"
-              onClick={() => botUrl && window.open(botUrl, '_blank', 'noopener,noreferrer')}
-              disabled={!botUrl}
-            >
-              Botni ochish
-            </Button>
           </div>
         </div>
       ) : null}
